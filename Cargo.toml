@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+default-members = ["crates/ezyx-app", "crates/ezyx-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["EZ-YX-craft contributors"]
+repository = "https://github.com/your-org/ez-yx-craft"
+homepage = "https://github.com/your-org/ez-yx-craft"
+description = "EZ-YX-craft: open-source CNC design, CAM, simulation and machine control for wood and metal carving"
+
+[workspace.dependencies]
+# internal
+ezyx-core = { path = "crates/ezyx-core" }
+ezyx-tooldb = { path = "crates/ezyx-tooldb" }
+ezyx-materials = { path = "crates/ezyx-materials" }
+ezyx-cam = { path = "crates/ezyx-cam" }
+ezyx-gcode = { path = "crates/ezyx-gcode" }
+ezyx-machine = { path = "crates/ezyx-machine" }
+ezyx-image = { path = "crates/ezyx-image" }
+ezyx-mesh = { path = "crates/ezyx-mesh" }
+ezyx-cad = { path = "crates/ezyx-cad" }
+ezyx-sim = { path = "crates/ezyx-sim" }
+ezyx-gpu = { path = "crates/ezyx-gpu" }
+ezyx-ai = { path = "crates/ezyx-ai" }
+ezyx-project = { path = "crates/ezyx-project" }
+
+# external
+glam = { version = "0.34", features = ["serde"] }
+geo = "0.33"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+rayon = "1.10"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "tiff", "webp"] }
+ureq = { version = "3", features = ["json"] }
+tungstenite = "0.30"
+serialport = { version = "4.7", default-features = false }
+crossbeam-channel = "0.5"
+wgpu = "30"
+pollster = "0.4"
+eframe = "0.37"
+egui = "0.37"
+rfd = "0.15"
+clap = { version = "4.5", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+dirs = "6"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Geometry/CAM/sim code is hot even in debug builds; optimise deps so `cargo run` feels fast.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1

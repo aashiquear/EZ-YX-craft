@@ -1,0 +1,10 @@
+/target
+/dist
+**/*.rs.bk
+*.ezyx.bak
+.DS_Store
+.idea/
+.vscode/
+*.nc
+*.gcode
+!crates/**/tests/data/*.nc

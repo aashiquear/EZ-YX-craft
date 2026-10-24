@@ -1,0 +1,15 @@
+[package]
+name = "ezyx-gcode"
+description = "Configurable G-code post-processors (GRBL, grblHAL, FluidNC, Genmitsu, Makera Carvera, xTool laser, LinuxCNC, Mach3, Marlin) and a G-code parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ezyx-core.workspace = true
+ezyx-cam.workspace = true
+ezyx-tooldb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

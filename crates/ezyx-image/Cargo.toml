@@ -1,0 +1,13 @@
+[package]
+name = "ezyx-image"
+description = "Image processing for carving: sketch/photo to vectors, centerline, relief heightmaps, photo V-carve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ezyx-core.workspace = true
+image.workspace = true
+rayon.workspace = true
+serde.workspace = true

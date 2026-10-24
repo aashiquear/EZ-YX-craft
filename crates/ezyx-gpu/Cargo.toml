@@ -1,0 +1,16 @@
+[package]
+name = "ezyx-gpu"
+description = "GPU detection and backend selection (NVIDIA RTX/GTX, AMD RDNA/GCN/TeraScale, Intel, Apple) via wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["wgpu"]
+wgpu = ["dep:wgpu", "dep:pollster"]
+
+[dependencies]
+serde.workspace = true
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }

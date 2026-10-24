@@ -1,0 +1,11 @@
+[package]
+name = "ezyx-materials"
+description = "Stock material library (woods, metals, plastics) with machining groups and render appearance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+ezyx-tooldb.workspace = true

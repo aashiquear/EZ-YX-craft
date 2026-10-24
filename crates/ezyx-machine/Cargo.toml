@@ -1,0 +1,20 @@
+[package]
+name = "ezyx-machine"
+description = "CNC machine control for EZ-YX-craft: GRBL protocol, USB serial, Wi-Fi (TCP/telnet and WebSocket) transports, job streaming"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["serial"]
+serial = ["dep:serialport"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+crossbeam-channel.workspace = true
+tungstenite.workspace = true
+serialport = { workspace = true, optional = true }
+log.workspace = true

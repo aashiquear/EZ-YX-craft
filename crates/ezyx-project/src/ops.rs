@@ -1,0 +1,319 @@
+//! Operation specs (what the user configured) → toolpaths (what the machine runs).
+
+use crate::{Id, Project};
+use ezyx_cam::ops::{drill, engrave, pocket, polyline3d, profile, raster3d, rotary, vcarve};
+use ezyx_cam::{CutDirection, CutParams, Toolpath};
+use ezyx_core::{DVec2, DVec3, Heightmap, JobKind};
+use ezyx_tooldb::{feeds::MachineLimits, CuttingData, MaterialGroup, Operation, Tool, ToolLibrary};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ReliefSource {
+    /// All visible reliefs merged (max).
+    AllReliefs,
+    Relief(Id),
+    Part(Id),
+    Mesh(Id),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum OpKind {
+    Profile(profile::ProfileOptions),
+    Pocket(pocket::PocketOptions),
+    VCarve {
+        flat_depth: Option<f64>,
+        step: f64,
+        clearance_tool_id: Option<String>,
+    },
+    Drill(drill::DrillOptions),
+    Engrave,
+    Raster3d {
+        source: ReliefSource,
+        options: raster3d::Raster3dOptions,
+        resolution: f64,
+    },
+    /// Explicit 3D paths (photo V-carve, AI-generated, imported).
+    Paths3d {
+        paths: Vec<Vec<DVec3>>,
+        tolerance: f64,
+    },
+    Laser {
+        power: f64,
+        passes: usize,
+        focus_z: f64,
+    },
+}
+
+impl OpKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            OpKind::Profile(_) => "Profile",
+            OpKind::Pocket(_) => "Pocket",
+            OpKind::VCarve { .. } => "V-Carve",
+            OpKind::Drill(_) => "Drill",
+            OpKind::Engrave => "Engrave",
+            OpKind::Raster3d { options, .. } => {
+                if options.roughing {
+                    "3D Roughing"
+                } else {
+                    "3D Finishing"
+                }
+            }
+            OpKind::Paths3d { .. } => "Photo V-Carve / 3D paths",
+            OpKind::Laser { .. } => "Laser",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperationSpec {
+    pub id: Id,
+    pub name: String,
+    pub enabled: bool,
+    pub kind: OpKind,
+    pub tool_id: String,
+    pub pass: Operation,
+    pub start_depth: f64,
+    pub cut_depth: f64,
+    /// Empty = all vectors.
+    pub vector_ids: Vec<Id>,
+    pub direction: CutDirection,
+    /// User overrides of the library feeds/speeds.
+    pub cutting_override: Option<CuttingData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpResult {
+    pub op_id: Id,
+    pub toolpaths: Vec<Toolpath>,
+    pub error: Option<String>,
+    pub advice: Vec<ezyx_sim::Advice>,
+}
+
+pub fn material_group(p: &Project) -> MaterialGroup {
+    ezyx_materials::find(&p.job.material).map(|m| m.group).unwrap_or(MaterialGroup::Hardwood)
+}
+
+/// Library cutting data, rescaled when it comes from the 3018-tuned Genmitsu table.
+pub fn resolve_cutting(tool: &Tool, group: MaterialGroup, pass: Operation, machine: &MachineLimits) -> CuttingData {
+    let base = tool.cutting_for(group, pass, machine);
+    if base.source.contains("Genmitsu bit table") && (machine.max_rpm - 9000.0).abs() > 1.0 {
+        let one = ToolLibrary { tools: vec![Tool { cutting: vec![base.clone()], ..tool.clone() }] };
+        let scaled = one.scaled_for_machine(&MachineLimits::genmitsu_3018(), machine);
+        return scaled.tools[0].cutting[0].clone();
+    }
+    base
+}
+
+fn stock_heightmap(p: &Project, cell: f64) -> Heightmap {
+    Heightmap::covering(DVec2::ZERO, DVec2::new(p.job.width, p.job.height), cell, -p.job.thickness as f32)
+}
+
+/// Resolve a relief source to a heightmap in stock coordinates (Z ≤ 0, top = 0).
+pub fn relief_heightmap(p: &Project, src: &ReliefSource, cell: f64) -> Result<Heightmap, String> {
+    let floor = -p.job.thickness as f32;
+    match src {
+        ReliefSource::Relief(id) => p.reliefs.iter().find(|r| r.id == *id).map(|r| r.heightmap.clone()).ok_or_else(|| format!("relief #{id} not found")),
+        ReliefSource::AllReliefs => {
+            let mut out = stock_heightmap(p, cell);
+            if p.reliefs.is_empty() {
+                return Err("no reliefs in project".into());
+            }
+            for y in 0..out.height {
+                for x in 0..out.width {
+                    let c = out.cell_center(x, y);
+                    let mut z = floor;
+                    for r in p.reliefs.iter().filter(|r| r.visible) {
+                        if !r.heightmap.bounds().is_empty() {
+                            let b = r.heightmap.bounds();
+                            if c.x >= b.min.x && c.y >= b.min.y && c.x <= b.max.x && c.y <= b.max.y {
+                                z = z.max(r.heightmap.sample(c));
+                            }
+                        }
+                    }
+                    out.set(x, y, z);
+                }
+            }
+            Ok(out)
+        }
+        ReliefSource::Part(id) => {
+            let part = p.parts.iter().find(|q| q.id == *id).ok_or_else(|| format!("part #{id} not found"))?;
+            let mut hm = part.part.heightmap(cell, floor as f64);
+            // Centre on the stock.
+            let b = hm.bounds();
+            hm.origin += DVec2::new(p.job.width, p.job.height) * 0.5 - b.center();
+            Ok(hm)
+        }
+        ReliefSource::Mesh(id) => {
+            let m = p.meshes.iter().find(|q| q.id == *id).ok_or_else(|| format!("mesh #{id} not found"))?;
+            Ok(ezyx_mesh::raster::top_down(&m.mesh, DVec2::ZERO, DVec2::new(p.job.width, p.job.height), cell, floor))
+        }
+    }
+}
+
+pub fn compute_one(p: &Project, lib: &ToolLibrary, op: &OperationSpec) -> OpResult {
+    let mut res = OpResult { op_id: op.id, toolpaths: vec![], error: None, advice: vec![] };
+    let Some(tool) = lib.get(&op.tool_id).cloned() else {
+        res.error = Some(format!("tool '{}' not in library", op.tool_id));
+        return res;
+    };
+    let group = material_group(p);
+    let cutting = op.cutting_override.clone().unwrap_or_else(|| resolve_cutting(&tool, group, op.pass, &p.machine.limits));
+    let params = CutParams { tool: tool.clone(), cutting, start_depth: op.start_depth, cut_depth: op.cut_depth, safe_z: p.job.safe_z, direction: op.direction };
+    let vecs = p.paths_for(&op.vector_ids);
+    let name = op.name.as_str();
+    let mut tps: Vec<Toolpath> = match &op.kind {
+        OpKind::Profile(o) => vec![profile::generate(name, &vecs, &params, o)],
+        OpKind::Pocket(o) => vec![pocket::generate(name, &vecs, &params, o)],
+        OpKind::VCarve { flat_depth, step, clearance_tool_id } => {
+            let clearance = clearance_tool_id.as_ref().and_then(|id| lib.get(id)).map(|ct| CutParams {
+                tool: ct.clone(),
+                cutting: resolve_cutting(ct, group, Operation::Roughing, &p.machine.limits),
+                ..params.clone()
+            });
+            vcarve::generate(name, &vecs, &params, &vcarve::VCarveOptions { flat_depth: *flat_depth, step: *step, clearance })
+        }
+        OpKind::Drill(o) => vec![drill::generate(name, &drill::centers(&vecs), &params, o)],
+        OpKind::Engrave => vec![engrave::generate(name, &vecs, &params)],
+        OpKind::Raster3d { source, options, resolution } => {
+            let rotary_mesh = matches!((source, &p.job.kind), (ReliefSource::Mesh(_), JobKind::Rotary { .. }));
+            let hm = if rotary_mesh {
+                let (ReliefSource::Mesh(id), JobKind::Rotary { diameter, length, .. }) = (source, &p.job.kind) else { unreachable!() };
+                match p.meshes.iter().find(|m| m.id == *id) {
+                    Some(m) => Ok(ezyx_mesh::raster::cylindrical(&m.mesh, (0.0, *length), diameter * 0.5, *resolution)),
+                    None => Err(format!("mesh #{id} not found")),
+                }
+            } else {
+                relief_heightmap(p, source, *resolution)
+            };
+            match hm {
+                Ok(hm) => vec![raster3d::generate(name, &hm, &params, options)],
+                Err(e) => {
+                    res.error = Some(e);
+                    vec![]
+                }
+            }
+        }
+        OpKind::Paths3d { paths, tolerance } => vec![polyline3d::generate(name, paths, &params, *tolerance)],
+        OpKind::Laser { power, passes, focus_z } => vec![engrave::laser(name, &vecs, &params, *power, *focus_z, *passes)],
+    };
+    for tp in &tps {
+        res.advice.extend(ezyx_sim::advise(tp, group, &p.machine.limits));
+    }
+    if let JobKind::Rotary { diameter, .. } = p.job.kind {
+        tps = tps.iter().map(|t| rotary::wrap(t, diameter)).collect();
+    }
+    res.toolpaths = tps;
+    res
+}
+
+pub fn compute_all(p: &Project, lib: &ToolLibrary) -> Vec<OpResult> {
+    p.operations.iter().filter(|o| o.enabled).map(|o| compute_one(p, lib, o)).collect()
+}
+
+/// Warnings about the program vs the machine (travel, rotary support).
+pub fn validate(p: &Project, tps: &[Toolpath]) -> Vec<String> {
+    let mut w = Vec::new();
+    let off = p.job.datum_offset();
+    for tp in tps {
+        let s = tp.stats(p.machine.limits.max_feed);
+        let span = [s.max[0] - s.min[0], if tp.rotary { 0.0 } else { s.max[1] - s.min[1] }, s.max[2] - s.min[2]];
+        for (i, axis) in ["X", "Y", "Z"].iter().enumerate() {
+            if p.machine.travel[i] > 0.0 && span[i] > p.machine.travel[i] {
+                w.push(format!("{}: {} span {:.1} mm exceeds machine travel {:.1} mm", tp.name, axis, span[i], p.machine.travel[i]));
+            }
+        }
+        if tp.rotary && !p.machine.has_rotary {
+            w.push(format!("{}: rotary toolpath but the machine profile has no rotary axis", tp.name));
+        }
+        let _ = off;
+    }
+    w
+}
+
+/// Full pipeline: compute → validate → post.
+pub fn export_gcode(p: &Project, lib: &ToolLibrary) -> Result<(String, Vec<String>), String> {
+    let results = compute_all(p, lib);
+    let mut warnings: Vec<String> = results.iter().filter_map(|r| r.error.clone()).collect();
+    let tps: Vec<Toolpath> = results.into_iter().flat_map(|r| r.toolpaths).collect();
+    if tps.is_empty() {
+        return Err("no toolpaths to export".into());
+    }
+    warnings.extend(validate(p, &tps));
+    let post = ezyx_gcode::post::find_post(&p.post_id).ok_or_else(|| format!("unknown post '{}'", p.post_id))?;
+    let g = ezyx_gcode::emit(&p.job, &tps, &post, &p.name).map_err(|e| e.to_string())?;
+    Ok((g, warnings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::VectorSource;
+    use ezyx_core::path::shapes::{circle, rectangle};
+
+    fn proj() -> Project {
+        let mut p = Project::default();
+        let a = p.add_vector("outline", rectangle(DVec2::new(10.0, 10.0), 100.0, 60.0, 5.0), VectorSource::Drawn);
+        let b = p.add_vector("hole", circle(DVec2::new(60.0, 40.0), 10.0), VectorSource::Drawn);
+        let id = p.alloc_id();
+        p.operations.push(OperationSpec {
+            id,
+            name: "Pocket hole".into(),
+            enabled: true,
+            kind: OpKind::Pocket(Default::default()),
+            tool_id: "generic.flat_1_8_2f".into(),
+            pass: Operation::Roughing,
+            start_depth: 0.0,
+            cut_depth: 4.0,
+            vector_ids: vec![b],
+            direction: CutDirection::Climb,
+            cutting_override: None,
+        });
+        let id = p.alloc_id();
+        p.operations.push(OperationSpec {
+            id,
+            name: "Cut out".into(),
+            enabled: true,
+            kind: OpKind::Profile(profile::ProfileOptions { tabs: Some(Default::default()), ..Default::default() }),
+            tool_id: "generic.flat_1_8_2f".into(),
+            pass: Operation::Roughing,
+            start_depth: 0.0,
+            cut_depth: 18.0,
+            vector_ids: vec![a],
+            direction: CutDirection::Climb,
+            cutting_override: None,
+        });
+        p
+    }
+
+    #[test]
+    fn export_pipeline() {
+        let p = proj();
+        let lib = ToolLibrary::bundled();
+        let (g, w) = export_gcode(&p, &lib).unwrap();
+        assert!(g.contains("G1"));
+        assert!(w.is_empty(), "{w:?}");
+    }
+
+    #[test]
+    fn genmitsu_tool_scaled_for_4040() {
+        let lib = ToolLibrary::genmitsu();
+        let t = lib.tools.iter().find(|t| !t.cutting.is_empty()).unwrap();
+        let m = crate::machines::find("genmitsu_4040_pro_max").unwrap();
+        let c = resolve_cutting(t, t.cutting[0].material, t.cutting[0].operation, &m.limits);
+        assert!(c.rpm > 9000.0);
+        assert!(c.source.contains("rescaled"));
+    }
+
+    #[test]
+    fn rotary_job_wraps() {
+        let mut p = proj();
+        p.job = ezyx_core::JobSetup::rotary(60.0, 150.0);
+        p.machine = crate::machines::find("genmitsu_4040_pro_max").unwrap();
+        p.operations.retain(|o| o.name == "Pocket hole");
+        let r = compute_all(&p, &ToolLibrary::bundled());
+        assert!(r[0].toolpaths[0].rotary);
+        let (g, _) = export_gcode(&p, &ToolLibrary::bundled()).unwrap();
+        assert!(g.contains(" A"));
+    }
+}

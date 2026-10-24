@@ -1,0 +1,30 @@
+[package]
+name = "ezyx-cli"
+description = "EZ-YX-craft command line: headless G-code export, image pipelines, simulation previews, machine streaming, AI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ezyx"
+path = "src/main.rs"
+
+[dependencies]
+ezyx-core.workspace = true
+ezyx-tooldb.workspace = true
+ezyx-materials.workspace = true
+ezyx-cam.workspace = true
+ezyx-gcode.workspace = true
+ezyx-machine.workspace = true
+ezyx-image.workspace = true
+ezyx-mesh.workspace = true
+ezyx-cad.workspace = true
+ezyx-sim.workspace = true
+ezyx-gpu.workspace = true
+ezyx-ai.workspace = true
+ezyx-project.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+image.workspace = true
+serde_json.workspace = true

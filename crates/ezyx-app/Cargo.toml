@@ -1,0 +1,47 @@
+[package]
+name = "ezyx-app"
+description = "EZ-YX-craft desktop application (egui + wgpu)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ez-yx-craft"
+path = "src/main.rs"
+
+[dependencies]
+ezyx-core.workspace = true
+ezyx-tooldb.workspace = true
+ezyx-materials.workspace = true
+ezyx-cam.workspace = true
+ezyx-gcode.workspace = true
+ezyx-machine.workspace = true
+ezyx-image.workspace = true
+ezyx-mesh.workspace = true
+ezyx-cad.workspace = true
+ezyx-sim.workspace = true
+ezyx-gpu.workspace = true
+ezyx-ai.workspace = true
+ezyx-project.workspace = true
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+glam.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+crossbeam-channel.workspace = true
+dirs.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+# Installers (cargo-packager: .deb/.AppImage on Linux, .dmg/.app on macOS, .msi/NSIS on Windows)
+[package.metadata.packager]
+product-name = "EZ-YX-craft"
+identifier = "org.ezyxcraft.app"
+category = "GraphicsAndDesign"
+icons = ["../../assets/icon.png"]
+before-packaging-command = "cargo build --release -p ezyx-app"
+out-dir = "../../dist"
+binaries = [{ path = "ez-yx-craft", main = true }]

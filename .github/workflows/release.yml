@@ -1,0 +1,43 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  package:
+    name: package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            formats: deb,appimage
+          - os: macos-latest
+            formats: dmg
+          - os: windows-latest
+            formats: nsis,wix
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev libfuse2
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+      - name: Build release binaries
+        run: cargo build --release -p ezyx-app -p ezyx-cli
+      - name: Package installers
+        working-directory: crates/ezyx-app
+        run: cargo packager --release --formats ${{ matrix.formats }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/**/*.deb
+            dist/**/*.AppImage
+            dist/**/*.dmg
+            dist/**/*.msi
+            dist/**/*.exe

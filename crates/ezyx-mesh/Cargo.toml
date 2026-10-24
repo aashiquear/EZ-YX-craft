@@ -1,0 +1,15 @@
+[package]
+name = "ezyx-mesh"
+description = "Triangle & tetrahedral meshing for EZ-YX-craft: STL/OBJ IO, heightmap<->mesh, marching tetrahedra, quality tet meshes, image-to-3D"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ezyx-core.workspace = true
+ezyx-image.workspace = true
+glam.workspace = true
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "ezyx-sim"
+description = "Material-removal simulation and predicted-result rendering (wood grain / metal) for EZ-YX-craft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ezyx-core.workspace = true
+ezyx-cam.workspace = true
+ezyx-tooldb.workspace = true
+ezyx-materials.workspace = true
+ezyx-mesh.workspace = true
+glam.workspace = true
+rayon.workspace = true
+serde.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "ezyx-cam"
+description = "Toolpath generation (profile, pocket, V-carve, drill, engrave, 3D raster, rotary wrap) for EZ-YX-craft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ezyx-core.workspace = true
+ezyx-tooldb.workspace = true
+serde.workspace = true
+rayon.workspace = true
+glam.workspace = true
