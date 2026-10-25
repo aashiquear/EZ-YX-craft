@@ -6,7 +6,6 @@ pub const ACCENT: Color32 = Color32::from_rgb(232, 120, 40); // signal orange
 pub const ACCENT_SOFT: Color32 = Color32::from_rgb(250, 214, 180);
 pub const STEEL: Color32 = Color32::from_rgb(92, 108, 124);
 pub const WALNUT: Color32 = Color32::from_rgb(74, 52, 38);
-pub const MAPLE: Color32 = Color32::from_rgb(242, 230, 208);
 pub const OK: Color32 = Color32::from_rgb(70, 160, 90);
 pub const WARN: Color32 = Color32::from_rgb(220, 160, 40);
 pub const DANGER: Color32 = Color32::from_rgb(210, 60, 50);
@@ -53,5 +52,13 @@ pub fn depth_color(t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let a = [40.0, 170.0, 180.0];
     let b = [70.0, 40.0, 170.0];
+    Color32::from_rgb((a[0] + (b[0] - a[0]) * t) as u8, (a[1] + (b[1] - a[1]) * t) as u8, (a[2] + (b[2] - a[2]) * t) as u8)
+}
+
+/// Roughing passes: shallow = amber, deep = brick red (finishing uses [`depth_color`]).
+pub fn rough_color(t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let a = [235.0, 175.0, 60.0];
+    let b = [170.0, 50.0, 40.0];
     Color32::from_rgb((a[0] + (b[0] - a[0]) * t) as u8, (a[1] + (b[1] - a[1]) * t) as u8, (a[2] + (b[2] - a[2]) * t) as u8)
 }

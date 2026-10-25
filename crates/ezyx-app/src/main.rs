@@ -2,8 +2,13 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 mod app;
+mod docshots;
+mod image_studio;
+mod machine_control;
 mod panels;
+mod pipeline;
 mod ribbon;
+mod solid;
 mod tasks;
 mod theme;
 mod viewport;
