@@ -1,0 +1,1089 @@
+{
+  "app_version": "0.2.0",
+  "modules": [
+    {
+      "id": "pipeline",
+      "title": "The carving pipeline",
+      "chapter": "pipeline/index.md",
+      "summary": "The main window. A job moves through four steps — Stock, Design, Toolpaths, Output — and every design element is a feature on the timeline."
+    },
+    {
+      "id": "image",
+      "title": "Image Studio",
+      "chapter": "image/index.md",
+      "summary": "A separate window that turns photos, sketches and logos into 2D cuts, 2.5D reliefs, photo V-carves or 3D models and sends them to the pipeline."
+    },
+    {
+      "id": "solid",
+      "title": "Solid Modeler",
+      "chapter": "solid/index.md",
+      "summary": "A separate parametric part modeller (sketches, constraints, features, parameters) whose parts are carved in the pipeline as 2.5D reliefs or 3D models."
+    },
+    {
+      "id": "machine",
+      "title": "Machine Control",
+      "chapter": "machine/index.md",
+      "summary": "A separate window to connect to the CNC over USB, Wi-Fi or WebSocket, jog, zero, probe and run G-code from files or from the pipeline."
+    },
+    {
+      "id": "assistant",
+      "title": "AI assistant",
+      "chapter": "assistant.md",
+      "summary": "Claude, OpenAI or a local model that edits the project through the same commands as the GUI."
+    },
+    {
+      "id": "settings",
+      "title": "Windows, layout & settings",
+      "chapter": "settings.md",
+      "summary": "How the module windows are arranged and other preferences."
+    }
+  ],
+  "features": [
+    {
+      "id": "pipeline.overview",
+      "module": "pipeline",
+      "title": "The four steps",
+      "summary": "The step bar at the top of the main window walks a job from raw stock to G-code: ① Stock, ② Design, ③ Toolpaths, ④ Output. You can jump between steps at any time; later steps update automatically when you change an earlier one.",
+      "how_to": [
+        "Click a step in the step bar (or press Ctrl+1 … Ctrl+4).",
+        "Use Next → in the ribbon to move on when a step is done."
+      ],
+      "since": "0.2.0",
+      "shots": [
+        "pipeline_design"
+      ],
+      "chapter": "pipeline/index.md",
+      "keywords": [
+        "workflow",
+        "steps",
+        "wizard"
+      ]
+    },
+    {
+      "id": "pipeline.stock",
+      "module": "pipeline",
+      "title": "Stock setup",
+      "summary": "Decide what the machine cuts from: material, shape (rectangular board, round blank or rotary cylinder), size, where Z zero is (stock top or bed) and where XY zero sits on the stock. The machine profile and post-processor are chosen here too.",
+      "how_to": [
+        "Open ① Stock.",
+        "Pick a material — its colour is used for the rendered preview and its group for feeds and speeds.",
+        "Choose the shape and type the width, height and thickness.",
+        "Click a dot in the XY-zero grid to set the datum and choose Z zero.",
+        "Choose your machine; the matching post-processor is selected for you."
+      ],
+      "since": "0.2.0",
+      "shots": [
+        "pipeline_stock"
+      ],
+      "chapter": "pipeline/stock.md",
+      "keywords": [
+        "job setup",
+        "material",
+        "thickness",
+        "datum",
+        "round",
+        "rotary"
+      ]
+    },
+    {
+      "id": "pipeline.timeline",
+      "module": "pipeline",
+      "title": "Feature timeline",
+      "summary": "The left panel lists the stock and every feature in design order. Each feature shows what it is (2D cut, 2.5D relief, 3D model, photo V-carve), where it came from (drawn, file, Image Studio, Solid Modeler), its revision and any conflicts. Features can be renamed, reordered, hidden (suppressed) or reopened in the editor that made them.",
+      "how_to": [
+        "Click a feature to select it and see its properties.",
+        "Use ▲ ▼ to reorder, 👁 to suppress, 🗑 to delete.",
+        "Click ✏ Edit in Image Studio / Solid Modeler to return to the original editor."
+      ],
+      "since": "0.2.0",
+      "shots": [
+        "pipeline_design"
+      ],
+      "chapter": "pipeline/timeline.md",
+      "keywords": [
+        "features",
+        "history",
+        "tree",
+        "revision"
+      ]
+    },
+    {
+      "id": "pipeline.draw",
+      "module": "pipeline",
+      "title": "Drawing tools",
+      "summary": "Basic 2D drawing in the Design step: rectangle, circle, ellipse, polygon, star, polyline and TrueType text. While you draw you can type exact values (quick keys) instead of dragging.",
+      "how_to": [
+        "Pick a tool in the Draw group (R rectangle, C circle, P polyline, T text).",
+        "Drag on the stock — or click once and type the size, e.g. 120,60 then Enter.",
+        "Press Esc to go back to Select."
+      ],
+      "since": "0.2.0",
+      "shots": [
+        "pipeline_design"
+      ],
+      "chapter": "pipeline/design.md",
+      "keywords": [
+        "rectangle",
+        "circle",
+        "text",
+        "polyline",
+        "quick keys"
+      ]
+    },
+    {
+      "id": "pipeline.edit",
+      "module": "pipeline",
+      "title": "Editing, arranging & layers",
+      "summary": "Offset, weld (union), subtract and intersect closed shapes; move, scale, rotate and mirror with exact numbers; align and distribute several shapes; centre on the stock; organise vectors on layers you can hide or lock.",
+      "how_to": [
+        "Select shapes (click, Shift+click or drag a box).",
+        "Use the Edit and Arrange groups, or type position and size in the Selection panel.",
+        "Open the Layers section in the right panel to add, hide or lock layers."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "pipeline/design.md",
+      "keywords": [
+        "offset",
+        "boolean",
+        "weld",
+        "align",
+        "distribute",
+        "mirror",
+        "layers",
+        "transform"
+      ]
+    },
+    {
+      "id": "pipeline.snap",
+      "module": "pipeline",
+      "title": "Snapping & measuring",
+      "summary": "Snap the cursor to the grid, to shape corners and midpoints, and to the stock edges and centre. The measure tool shows distance and angle between two points.",
+      "how_to": [
+        "Toggle grid and object snap in the viewport toolbar (hold Alt to snap off temporarily).",
+        "Pick 📏 Measure and click two points."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "pipeline/design.md",
+      "keywords": [
+        "snap",
+        "grid",
+        "measure",
+        "dimension"
+      ]
+    },
+    {
+      "id": "pipeline.carve",
+      "module": "pipeline",
+      "title": "Carve tools",
+      "summary": "Turn selected vectors into a feature with one click: Cut out, Inside cut, Pocket, V-carve, Engrave, Drill or On the line. The feature gets a sensible depth for your stock and its toolpaths are planned automatically.",
+      "how_to": [
+        "Select the vectors.",
+        "Click a button in the Carve group.",
+        "Adjust the depth in the feature panel on the right."
+      ],
+      "since": "0.2.0",
+      "shots": [
+        "pipeline_design"
+      ],
+      "chapter": "pipeline/design.md",
+      "keywords": [
+        "cut out",
+        "pocket",
+        "v-carve",
+        "engrave",
+        "drill",
+        "profile"
+      ]
+    },
+    {
+      "id": "pipeline.import",
+      "module": "pipeline",
+      "title": "Importing designs",
+      "summary": "Bring in SVG/DXF vectors as 2D features and STL/OBJ meshes as 3D model features. Images open in the Image Studio, solid parts are made in the Solid Modeler; both send their results here.",
+      "how_to": [
+        "Design → Import → SVG/DXF or STL/OBJ.",
+        "For pictures use Design → Image Studio; for parts use Design → Solid Modeler."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "pipeline/design.md",
+      "keywords": [
+        "svg",
+        "dxf",
+        "stl",
+        "obj",
+        "import"
+      ]
+    },
+    {
+      "id": "pipeline.merge",
+      "module": "pipeline",
+      "title": "Editing a feature again (merge)",
+      "summary": "Features that came from the Image Studio or the Solid Modeler remember their source. Reopen the editor, change the design and press Update feature: the new revision replaces the old one in the same place on the stock, your bit choices are kept, toolpaths are regenerated and a merge report lists what changed downstream.",
+      "how_to": [
+        "Select the feature and click ✏ Edit in … (or double-click it).",
+        "Change the design in the editor window.",
+        "Click ⟳ Update feature in the editor.",
+        "Read the merge report: size change, regenerated toolpaths, re-targeted operations and new or resolved conflicts."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "pipeline/timeline.md",
+      "keywords": [
+        "reimport",
+        "revision",
+        "merge",
+        "round trip"
+      ]
+    },
+    {
+      "id": "pipeline.conflicts",
+      "module": "pipeline",
+      "title": "Conflict checks",
+      "summary": "The pipeline continuously checks for features that run off the stock, cut deeper than the stock is thick, overlap each other, lost their geometry, or whose bit is too big to cut anything, and for hand-made operations made for an older revision. Problems show as badges on the timeline and in the Conflicts list.",
+      "how_to": [
+        "Look for ⚠ / ✖ badges in the timeline.",
+        "Click a conflict to select the features involved."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "pipeline/timeline.md",
+      "keywords": [
+        "conflict",
+        "overlap",
+        "too deep",
+        "warnings",
+        "check"
+      ]
+    },
+    {
+      "id": "pipeline.toolpaths",
+      "module": "pipeline",
+      "title": "Automatic toolpaths",
+      "summary": "When you open ③ Toolpaths every feature already has the best roughing and finishing cycle for it: cut-outs get a roughing profile with allowance plus a finishing profile with tabs; pockets a large-bit clearing pass and a smaller-bit finish; V-carves a flat-floor clearance pass when the shape is wide; reliefs and 3D models a flat-end-mill roughing pass and a ball-nose finish. Operations run in a safe order: drilling, clearing, finishing, cut-outs last.",
+      "how_to": [
+        "Open ③ Toolpaths.",
+        "Check the plan per feature in the left panel.",
+        "Click ⚡ Recalculate after changes, or 🪄 Auto-plan all to reset to the defaults."
+      ],
+      "since": "0.2.0",
+      "shots": [
+        "pipeline_toolpaths"
+      ],
+      "chapter": "pipeline/toolpaths.md",
+      "keywords": [
+        "toolpath",
+        "roughing",
+        "finishing",
+        "auto",
+        "strategy"
+      ]
+    },
+    {
+      "id": "pipeline.bits",
+      "module": "pipeline",
+      "title": "Choosing bits",
+      "summary": "Every feature's plan can use different bits for roughing and finishing, skip a pass, change the finishing allowance or turn tabs off. Your choices are kept when toolpaths are recalculated or the feature is re-imported.",
+      "how_to": [
+        "Select a feature in ③ Toolpaths.",
+        "Pick the roughing and finishing bit (type to filter, e.g. 'ball 1/8').",
+        "Click ⚡ Recalculate."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "pipeline/toolpaths.md",
+      "keywords": [
+        "tool",
+        "bit",
+        "end mill",
+        "ball nose",
+        "v-bit",
+        "feeds"
+      ]
+    },
+    {
+      "id": "pipeline.manual_ops",
+      "module": "pipeline",
+      "title": "Hand-made operations (advanced)",
+      "summary": "Add your own profile, pocket, V-carve, drill, engrave, laser or 3D operation with full control over feeds, depths and options. Hand-made operations are never overwritten by the planner.",
+      "how_to": [
+        "③ Toolpaths → Advanced → pick an operation type.",
+        "Edit it in the right panel."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "pipeline/toolpaths.md",
+      "keywords": [
+        "operation",
+        "custom",
+        "laser",
+        "feeds and speeds"
+      ]
+    },
+    {
+      "id": "pipeline.preview",
+      "module": "pipeline",
+      "title": "Toolpath preview",
+      "summary": "Show roughing, finishing or both toolpaths in 2D or 3D, coloured by depth, and simulate material removal for exactly what is shown.",
+      "how_to": [
+        "Use the Show: Rough / Finish / Both switch.",
+        "Click 👁 Simulate to cut the virtual stock."
+      ],
+      "since": "0.2.0",
+      "shots": [
+        "pipeline_preview"
+      ],
+      "chapter": "pipeline/toolpaths.md",
+      "keywords": [
+        "preview",
+        "simulate",
+        "rough",
+        "finish"
+      ]
+    },
+    {
+      "id": "pipeline.render",
+      "module": "pipeline",
+      "title": "Final rendered view",
+      "summary": "The simulated result is rendered in your material (walnut, maple, oak, MDF, aluminium…) with machining advice such as scallop height, burn risk and overload warnings.",
+      "how_to": [
+        "Click ✨ Final render.",
+        "Orbit with the left mouse button; use the view buttons for top/front/iso."
+      ],
+      "since": "0.2.0",
+      "shots": [
+        "pipeline_preview"
+      ],
+      "chapter": "pipeline/toolpaths.md",
+      "keywords": [
+        "render",
+        "material",
+        "result",
+        "advice"
+      ]
+    },
+    {
+      "id": "pipeline.output",
+      "module": "pipeline",
+      "title": "G-code & job sheet",
+      "summary": "Check the summary (time estimate, bits in order, tool changes, warnings), then save G-code for your machine's post-processor or a printable job sheet.",
+      "how_to": [
+        "Open ④ Output.",
+        "Confirm the machine and post-processor.",
+        "Click 💾 Download G-code (or 📄 Job sheet)."
+      ],
+      "since": "0.2.0",
+      "shots": [
+        "pipeline_output"
+      ],
+      "chapter": "pipeline/output.md",
+      "keywords": [
+        "gcode",
+        "post",
+        "export",
+        "job sheet",
+        "nc"
+      ]
+    },
+    {
+      "id": "pipeline.send_machine",
+      "module": "pipeline",
+      "title": "Send to Machine Control",
+      "summary": "Hand the G-code straight to the Machine Control window, which opens with the job loaded and ready to run.",
+      "how_to": [
+        "Open ④ Output.",
+        "Click 🎮 Send to Machine Control."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "pipeline/output.md",
+      "keywords": [
+        "send",
+        "machine",
+        "stream"
+      ]
+    },
+    {
+      "id": "image.studio",
+      "module": "image",
+      "title": "Image Studio",
+      "summary": "Its own window with an image viewer, live processing preview and the conversion settings. Open it from the Design step or the module buttons at the top; it can sit next to the main window.",
+      "how_to": [
+        "Click 🖼 Image Studio.",
+        "Load a photo, sketch or logo.",
+        "Choose a conversion mode and tune it while watching the preview."
+      ],
+      "since": "0.2.0",
+      "shots": [
+        "image_studio"
+      ],
+      "chapter": "image/index.md",
+      "keywords": [
+        "image",
+        "picture",
+        "photo",
+        "logo"
+      ]
+    },
+    {
+      "id": "image.outline",
+      "module": "image",
+      "title": "Trace outline → 2D cut",
+      "summary": "Logos and silhouettes become closed vectors for cut-outs, pockets or V-carving. Threshold (auto, fixed, adaptive, edges), invert, smoothing, gap closing and speck removal clean up the input.",
+      "how_to": [
+        "Mode: Outline.",
+        "Tune the threshold until the preview looks right.",
+        "Pick the strategy and click Send to pipeline."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "image/index.md",
+      "keywords": [
+        "trace",
+        "vectorize",
+        "outline",
+        "logo"
+      ]
+    },
+    {
+      "id": "image.sketch",
+      "module": "image",
+      "title": "Sketch → single line",
+      "summary": "Pen and pencil drawings become single centre-line paths for engraving.",
+      "how_to": [
+        "Mode: Sketch.",
+        "Use Adaptive threshold for pencil on uneven paper.",
+        "Send to pipeline (strategy: Engrave)."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "image/index.md",
+      "keywords": [
+        "centreline",
+        "centerline",
+        "sketch",
+        "engrave"
+      ]
+    },
+    {
+      "id": "image.relief",
+      "module": "image",
+      "title": "Image → 2.5D relief",
+      "summary": "Greyscale becomes height: bright = high (or invert), with gamma, smoothing, size and depth.",
+      "how_to": [
+        "Mode: Relief.",
+        "Set width, depth and gamma.",
+        "Send to pipeline as a 2.5D relief."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "image/index.md",
+      "keywords": [
+        "relief",
+        "heightmap",
+        "lithophane",
+        "2.5d"
+      ]
+    },
+    {
+      "id": "image.photo_vcarve",
+      "module": "image",
+      "title": "Photo V-carve",
+      "summary": "Shaded photos become V-grooves whose depth follows the darkness, as lines, waves or circles.",
+      "how_to": [
+        "Mode: Photo V-carve.",
+        "Choose the V-bit angle, line spacing and pattern.",
+        "Send to pipeline."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "image/index.md",
+      "keywords": [
+        "photo",
+        "v-carve",
+        "grooves",
+        "portrait"
+      ]
+    },
+    {
+      "id": "image.to3d",
+      "module": "image",
+      "title": "Image → 3D model",
+      "summary": "A silhouette (transparent PNGs work best) is inflated into a 3D model that is carved top-down. AI image-to-3D services can be plugged in.",
+      "how_to": [
+        "Mode: 3D model.",
+        "Set the thickness.",
+        "Send to pipeline as a 3D model."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "image/index.md",
+      "keywords": [
+        "3d",
+        "inflate",
+        "image to 3d"
+      ]
+    },
+    {
+      "id": "image.send",
+      "module": "image",
+      "title": "Send to pipeline / update feature",
+      "summary": "Send creates a new feature in the pipeline, centred on the stock. When the studio was opened from an existing feature the button becomes Update feature and the result is merged in place.",
+      "how_to": [
+        "Click Send to pipeline (new feature) or ⟳ Update feature (new revision)."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "image/index.md",
+      "keywords": [
+        "send",
+        "update",
+        "pipeline"
+      ]
+    },
+    {
+      "id": "solid.modeler",
+      "module": "solid",
+      "title": "Solid Modeler",
+      "summary": "A SolidWorks-style part modeller in its own window: the FeatureManager tree on the left, a 3D view in the middle, the PropertyManager on the right and a CommandManager with Sketch, Features, Evaluate and Export tabs on top.",
+      "how_to": [
+        "Click 🧊 Solid Modeler.",
+        "Start from a template or an empty part.",
+        "Build the part from sketches and features."
+      ],
+      "since": "0.2.0",
+      "shots": [
+        "solid_modeler"
+      ],
+      "chapter": "solid/index.md",
+      "keywords": [
+        "cad",
+        "solidworks",
+        "part",
+        "model"
+      ]
+    },
+    {
+      "id": "solid.sketch",
+      "module": "solid",
+      "title": "Sketches & constraints",
+      "summary": "Draw lines, rectangles, circles, arcs and splines on the XY, XZ or YZ plane, then constrain them: coincident, horizontal, vertical, parallel, perpendicular, tangent, equal, concentric, midpoint, symmetric, fix, and driving dimensions (length, distance, radius, diameter, angle) that may use parameters. The solver shows whether the sketch is fully defined.",
+      "how_to": [
+        "Sketch tab → New sketch → pick a plane.",
+        "Draw with the sketch tools; click two entities and a constraint button.",
+        "Add dimensions; type a value or a parameter expression such as width/2.",
+        "Watch the status: under-defined (degrees of freedom left), fully defined or over-defined."
+      ],
+      "since": "0.2.0",
+      "shots": [
+        "solid_sketch"
+      ],
+      "chapter": "solid/sketch.md",
+      "keywords": [
+        "sketch",
+        "constraint",
+        "dimension",
+        "solver"
+      ]
+    },
+    {
+      "id": "solid.features",
+      "module": "solid",
+      "title": "Extrude, revolve, sweep & loft",
+      "summary": "Extrude a sketch (blind, mid-plane or through all, with draft and rounded or chamfered cap edges), revolve it (full or partial), sweep a profile along a path, or loft between sections. Each feature adds, cuts or intersects with the body.",
+      "how_to": [
+        "Features tab → choose the feature.",
+        "Set its options in the PropertyManager.",
+        "Choose Add / Cut / Intersect."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "solid/features.md",
+      "keywords": [
+        "extrude",
+        "boss",
+        "cut",
+        "revolve",
+        "sweep",
+        "loft"
+      ]
+    },
+    {
+      "id": "solid.dress",
+      "module": "solid",
+      "title": "Fillet, chamfer, shell & draft",
+      "summary": "Round or chamfer where a feature meets the body, fillet the whole part, hollow it with a shell (optionally open at the top, for enclosures) and add draft to extrusions.",
+      "how_to": [
+        "Select a feature and set Blend (round / chamfer) in the PropertyManager.",
+        "Or Features → Fillet all / Shell."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "solid/features.md",
+      "keywords": [
+        "fillet",
+        "chamfer",
+        "shell",
+        "draft",
+        "round"
+      ]
+    },
+    {
+      "id": "solid.holes",
+      "module": "solid",
+      "title": "Hole wizard & threads",
+      "summary": "Simple, drilled, counterbored, countersunk and tapped holes, and modelled external or internal threads.",
+      "how_to": [
+        "Features → Hole wizard.",
+        "Pick the hole type and size, place it on the top face."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "solid/features.md",
+      "keywords": [
+        "hole",
+        "counterbore",
+        "countersink",
+        "tap",
+        "thread"
+      ]
+    },
+    {
+      "id": "solid.patterns",
+      "module": "solid",
+      "title": "Patterns & mirror",
+      "summary": "Linear, grid and circular patterns of a feature, and mirror about the YZ, XZ or XY plane.",
+      "how_to": [
+        "Select a feature → Pattern / Mirror in the PropertyManager."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "solid/features.md",
+      "keywords": [
+        "pattern",
+        "array",
+        "mirror",
+        "circular"
+      ]
+    },
+    {
+      "id": "solid.bodies",
+      "module": "solid",
+      "title": "Split, combine & scale",
+      "summary": "Split the part by a plane, combine it with another part (add, subtract, common) and scale it.",
+      "how_to": [
+        "Features → Split / Combine.",
+        "For Combine pick the other part and the operation."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "solid/features.md",
+      "keywords": [
+        "split",
+        "combine",
+        "boolean",
+        "multibody",
+        "scale"
+      ]
+    },
+    {
+      "id": "solid.parameters",
+      "module": "solid",
+      "title": "Parameters & configurations",
+      "summary": "Named parameters with unit-aware expressions (e.g. wall = 2 mm, width = 3 in, hole = width/8) drive dimensions and feature values. Configurations override parameters to make size variants of one part.",
+      "how_to": [
+        "Open the Parameters tab of the FeatureManager.",
+        "Add a parameter and bind it to a feature value with the ƒ button.",
+        "Add a configuration and switch between them."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "solid/parameters.md",
+      "keywords": [
+        "parameter",
+        "expression",
+        "equation",
+        "configuration",
+        "variant"
+      ]
+    },
+    {
+      "id": "solid.evaluate",
+      "module": "solid",
+      "title": "Mass properties & interference",
+      "summary": "Volume, surface area, centre of mass, bounding box and mass for the chosen material, section area at a height, and the interference volume between two parts.",
+      "how_to": [
+        "Evaluate tab → Mass properties.",
+        "Evaluate → Interference: pick another part."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "solid/evaluate.md",
+      "keywords": [
+        "mass",
+        "volume",
+        "weight",
+        "center of mass",
+        "interference"
+      ]
+    },
+    {
+      "id": "solid.templates",
+      "module": "solid",
+      "title": "Starter templates",
+      "summary": "Ready-made parametric parts to learn from or adapt: enclosure, flange with bolt circle, knob, threaded rod, lofted vase.",
+      "how_to": [
+        "New part → From template."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "solid/index.md",
+      "keywords": [
+        "template",
+        "example",
+        "starter"
+      ]
+    },
+    {
+      "id": "solid.export",
+      "module": "solid",
+      "title": "Export & send to pipeline",
+      "summary": "Send the part to the pipeline as a 2.5D relief (top-down height field) or as a 3D model, update the feature made from it, export STL/OBJ, or a tetrahedral mesh (VTK/Gmsh) for analysis.",
+      "how_to": [
+        "Export tab → Send to pipeline as 2.5D or 3D.",
+        "After editing, ⟳ Update pipeline feature.",
+        "Or export STL / OBJ / tet mesh."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "solid/evaluate.md",
+      "keywords": [
+        "export",
+        "stl",
+        "obj",
+        "tet mesh",
+        "send"
+      ]
+    },
+    {
+      "id": "solid.solidcraft",
+      "module": "solid",
+      "title": "SolidCraft bridge",
+      "summary": "If the open-source SolidCraft CAD is installed, open the part's mesh in it for B-rep work (STEP, assemblies, sheet metal) and import its STL/OBJ exports back as a pipeline feature.",
+      "how_to": [
+        "Export tab → Open in SolidCraft (shown when solidcraft is on your PATH).",
+        "Export STL from SolidCraft, then Import STL/OBJ here."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "solid/index.md",
+      "keywords": [
+        "solidcraft",
+        "step",
+        "brep",
+        "interop"
+      ]
+    },
+    {
+      "id": "machine.control",
+      "module": "machine",
+      "title": "Machine Control window",
+      "summary": "A separate window that never changes your design: connection bar, big position read-out, jog pad, job queue with a path preview, run controls, overrides and console. It works with files from anywhere as well as jobs sent from the pipeline.",
+      "how_to": [
+        "Click 🎮 Machine Control."
+      ],
+      "since": "0.2.0",
+      "shots": [
+        "machine_control"
+      ],
+      "chapter": "machine/index.md",
+      "keywords": [
+        "machine",
+        "control",
+        "sender",
+        "dro"
+      ]
+    },
+    {
+      "id": "machine.connect",
+      "module": "machine",
+      "title": "Connecting: USB, Wi-Fi, WebSocket, simulator",
+      "summary": "Choose USB serial (port + baud), Wi-Fi TCP/telnet, WebSocket, or the built-in simulator. Scan your network for controllers.",
+      "how_to": [
+        "Pick the link type.",
+        "Choose the port or host (or 🔍 Find machines).",
+        "Click Connect."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "machine/index.md",
+      "keywords": [
+        "usb",
+        "serial",
+        "wifi",
+        "websocket",
+        "grbl",
+        "connect"
+      ]
+    },
+    {
+      "id": "machine.jog",
+      "module": "machine",
+      "title": "Jogging, homing & zeroing",
+      "summary": "Large jog buttons with step sizes and feed, home, unlock, and zero any axis. Keyboard jogging with the arrow keys and Page Up/Down when the window has focus.",
+      "how_to": [
+        "Choose a step size.",
+        "Click the arrows (or use the keyboard).",
+        "Zero X, Y and Z at your datum."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "machine/index.md",
+      "keywords": [
+        "jog",
+        "home",
+        "zero",
+        "unlock",
+        "keyboard"
+      ]
+    },
+    {
+      "id": "machine.probe",
+      "module": "machine",
+      "title": "Z probe",
+      "summary": "Probe the stock top with a touch plate of known thickness.",
+      "how_to": [
+        "Attach the clip and place the plate.",
+        "Set the plate thickness and click ⬇ Probe Z."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "machine/index.md",
+      "keywords": [
+        "probe",
+        "touch plate",
+        "z zero"
+      ]
+    },
+    {
+      "id": "machine.jobs",
+      "module": "machine",
+      "title": "Running jobs",
+      "summary": "Load G-code files or receive jobs from the pipeline, check the path preview and estimated time, then run, pause, resume or stop. A safety checklist is shown before the machine moves.",
+      "how_to": [
+        "Load a file or pick a job sent from the pipeline.",
+        "Click ▶ Run and confirm the checklist."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "machine/index.md",
+      "keywords": [
+        "run",
+        "job",
+        "gcode",
+        "pause",
+        "stop"
+      ]
+    },
+    {
+      "id": "machine.console",
+      "module": "machine",
+      "title": "Overrides & console",
+      "summary": "Feed and spindle overrides while running, and a console for G-code and $ commands.",
+      "how_to": [
+        "Use the ±10 % buttons while a job runs.",
+        "Type a command in the console and press Enter."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "machine/index.md",
+      "keywords": [
+        "override",
+        "console",
+        "$ settings"
+      ]
+    },
+    {
+      "id": "assistant.chat",
+      "module": "assistant",
+      "title": "AI assistant",
+      "summary": "Ask in plain language — \"make a 200×100 walnut sign that says Workshop\" — and the assistant builds features, plans toolpaths and (only after you confirm) writes files or moves the machine. Every change is undoable.",
+      "how_to": [
+        "Click 🤖 Assistant.",
+        "Choose Claude, OpenAI or Ollama in its settings.",
+        "Type a request."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "assistant.md",
+      "keywords": [
+        "ai",
+        "assistant",
+        "claude",
+        "chat"
+      ]
+    },
+    {
+      "id": "settings.windows",
+      "module": "settings",
+      "title": "Module windows side by side",
+      "summary": "Image Studio, Solid Modeler and Machine Control open as their own windows so they can sit next to the pipeline. ⧉ Tile places the open windows side by side; a preference shows them inside the main window instead.",
+      "how_to": [
+        "Open a module from the top bar.",
+        "Click ⧉ Tile to arrange the windows.",
+        "Settings → Windows to choose separate or embedded windows."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "settings.md",
+      "keywords": [
+        "windows",
+        "layout",
+        "side by side",
+        "tile"
+      ]
+    },
+    {
+      "id": "settings.general",
+      "module": "settings",
+      "title": "Units, theme & performance",
+      "summary": "Millimetres or inches, light or dark theme, and simulation detail (set from your GPU tier).",
+      "how_to": [
+        "Open ⚙ Settings."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "settings.md",
+      "keywords": [
+        "units",
+        "inches",
+        "dark mode",
+        "gpu"
+      ]
+    }
+  ],
+  "shots": [
+    {
+      "id": "pipeline_stock",
+      "workspace": "pipeline",
+      "step": "stock",
+      "project": "",
+      "setup": [],
+      "caption": "① Stock: material, shape, size and datum",
+      "size": [
+        1480,
+        920
+      ]
+    },
+    {
+      "id": "pipeline_design",
+      "workspace": "pipeline",
+      "step": "design",
+      "project": "",
+      "setup": [],
+      "caption": "② Design: drawing and carve tools with the feature timeline",
+      "size": [
+        1480,
+        920
+      ]
+    },
+    {
+      "id": "pipeline_toolpaths",
+      "workspace": "pipeline",
+      "step": "toolpaths",
+      "project": "",
+      "setup": [
+        "select_feature:0"
+      ],
+      "caption": "③ Toolpaths: the automatic roughing and finishing plan",
+      "size": [
+        1480,
+        920
+      ]
+    },
+    {
+      "id": "pipeline_preview",
+      "workspace": "pipeline",
+      "step": "toolpaths",
+      "project": "",
+      "setup": [
+        "simulate"
+      ],
+      "caption": "Simulated result rendered in the stock material",
+      "size": [
+        1480,
+        920
+      ]
+    },
+    {
+      "id": "pipeline_output",
+      "workspace": "pipeline",
+      "step": "output",
+      "project": "",
+      "setup": [],
+      "caption": "④ Output: summary, G-code and job sheet",
+      "size": [
+        1480,
+        920
+      ]
+    },
+    {
+      "id": "image_studio",
+      "workspace": "image",
+      "step": "outline",
+      "project": "",
+      "setup": [
+        "image:examples/images/tree_logo.png"
+      ],
+      "caption": "Image Studio tracing a logo",
+      "size": [
+        1480,
+        920
+      ]
+    },
+    {
+      "id": "solid_modeler",
+      "workspace": "solid",
+      "step": "features",
+      "project": "",
+      "setup": [
+        "template:0"
+      ],
+      "caption": "Solid Modeler with a parametric template",
+      "size": [
+        1480,
+        920
+      ]
+    },
+    {
+      "id": "solid_sketch",
+      "workspace": "solid",
+      "step": "sketch",
+      "project": "",
+      "setup": [
+        "sketch_demo"
+      ],
+      "caption": "Constrained sketch with driving dimensions",
+      "size": [
+        1480,
+        920
+      ]
+    },
+    {
+      "id": "machine_control",
+      "workspace": "machine",
+      "step": "control",
+      "project": "",
+      "setup": [
+        "connect_sim"
+      ],
+      "caption": "Machine Control connected to the simulator",
+      "size": [
+        1480,
+        920
+      ]
+    }
+  ]
+}
