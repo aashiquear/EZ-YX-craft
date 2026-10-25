@@ -150,6 +150,9 @@ impl ProjectHost<'_> {
             vector_ids: ids,
             direction: Default::default(),
             cutting_override: None,
+            feature_id: None,
+            auto: false,
+            feature_rev: 0,
         };
         self.history.execute(self.project, &Command::AddOperation { spec })
     }

@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "name": "OAK sign",
   "job": {
     "kind": "Flat",
@@ -48,7 +48,8 @@
         30,
         30,
         30
-      ]
+      ],
+      "locked": false
     }
   ],
   "vectors": [
@@ -3635,20 +3636,20 @@
   "parts": [],
   "operations": [
     {
-      "id": 8,
-      "name": "V-carve text",
+      "id": 14,
+      "name": "Lettering · V-carve",
       "enabled": true,
       "kind": {
         "VCarve": {
-          "flat_depth": null,
-          "step": 0.25,
-          "clearance_tool_id": null
+          "flat_depth": 4.0,
+          "step": 0.2,
+          "clearance_tool_id": "generic.flat_1_4_2f"
         }
       },
-      "tool_id": "generic.v60",
+      "tool_id": "generic.v90",
       "pass": "Finishing",
       "start_depth": 0.0,
-      "cut_depth": 10.0,
+      "cut_depth": 4.0,
       "vector_ids": [
         3,
         4,
@@ -3657,31 +3658,37 @@
         7
       ],
       "direction": "Climb",
-      "cutting_override": null
+      "cutting_override": null,
+      "feature_id": 8,
+      "auto": true,
+      "feature_rev": 1
     },
     {
-      "id": 9,
-      "name": "Border groove",
+      "id": 15,
+      "name": "Border groove · engrave",
       "enabled": true,
       "kind": "Engrave",
       "tool_id": "generic.v90",
       "pass": "Finishing",
       "start_depth": 0.0,
-      "cut_depth": 2.0,
+      "cut_depth": 1.5,
       "vector_ids": [
         2
       ],
       "direction": "Climb",
-      "cutting_override": null
+      "cutting_override": null,
+      "feature_id": 10,
+      "auto": true,
+      "feature_rev": 1
     },
     {
-      "id": 10,
-      "name": "Cut out",
+      "id": 16,
+      "name": "Cut out · rough",
       "enabled": true,
       "kind": {
         "Profile": {
           "side": "Outside",
-          "allowance": 0.0,
+          "allowance": 0.3,
           "tabs": {
             "count_per_loop": 4,
             "length": 6.0,
@@ -3699,9 +3706,127 @@
         1
       ],
       "direction": "Climb",
-      "cutting_override": null
+      "cutting_override": null,
+      "feature_id": 13,
+      "auto": true,
+      "feature_rev": 1
+    },
+    {
+      "id": 17,
+      "name": "Cut out · finish",
+      "enabled": true,
+      "kind": {
+        "Profile": {
+          "side": "Outside",
+          "allowance": 0.0,
+          "tabs": {
+            "count_per_loop": 4,
+            "length": 6.0,
+            "height": 2.0
+          },
+          "ramp_length": 5.0,
+          "finish_pass": 0.0
+        }
+      },
+      "tool_id": "generic.flat_1_4_2f",
+      "pass": "Finishing",
+      "start_depth": 0.0,
+      "cut_depth": 18.0,
+      "vector_ids": [
+        1
+      ],
+      "direction": "Climb",
+      "cutting_override": null,
+      "feature_id": 13,
+      "auto": true,
+      "feature_rev": 1
     }
   ],
+  "features": [
+    {
+      "id": 8,
+      "name": "Lettering",
+      "kind": {
+        "Cut2D": {
+          "vector_ids": [
+            3,
+            4,
+            5,
+            6,
+            7
+          ],
+          "strategy": "VCarve",
+          "depth": 4.0
+        }
+      },
+      "source": "Drawn",
+      "revision": 1,
+      "plan": {
+        "roughing": true,
+        "finishing": true,
+        "rough_tool": null,
+        "finish_tool": null,
+        "allowance": 0.3,
+        "tabs": true,
+        "hand_rough": false,
+        "hand_finish": false
+      },
+      "suppressed": false
+    },
+    {
+      "id": 10,
+      "name": "Border groove",
+      "kind": {
+        "Cut2D": {
+          "vector_ids": [
+            2
+          ],
+          "strategy": "Engrave",
+          "depth": 1.5
+        }
+      },
+      "source": "Drawn",
+      "revision": 1,
+      "plan": {
+        "roughing": true,
+        "finishing": true,
+        "rough_tool": null,
+        "finish_tool": null,
+        "allowance": 0.3,
+        "tabs": true,
+        "hand_rough": false,
+        "hand_finish": false
+      },
+      "suppressed": false
+    },
+    {
+      "id": 13,
+      "name": "Cut out",
+      "kind": {
+        "Cut2D": {
+          "vector_ids": [
+            1
+          ],
+          "strategy": "CutOut",
+          "depth": 18.0
+        }
+      },
+      "source": "Drawn",
+      "revision": 1,
+      "plan": {
+        "roughing": true,
+        "finishing": true,
+        "rough_tool": null,
+        "finish_tool": null,
+        "allowance": 0.3,
+        "tabs": true,
+        "hand_rough": false,
+        "hand_finish": false
+      },
+      "suppressed": false
+    }
+  ],
+  "stock_shape": "Rectangle",
   "post_id": "genmitsu_grbl",
-  "next_id": 11
+  "next_id": 18
 }

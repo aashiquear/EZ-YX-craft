@@ -8,10 +8,14 @@
 
 pub mod agent_host;
 pub mod commands;
+pub mod demo;
 pub mod img3d_remote;
 pub mod import;
+pub mod jobsheet;
 pub mod machines;
 pub mod ops;
+pub mod pipeline;
+pub mod registry;
 pub mod text;
 
 use ezyx_cad::Part;
@@ -22,8 +26,10 @@ use serde::{Deserialize, Serialize};
 pub use commands::{Command, History};
 pub use machines::MachineProfile;
 pub use ops::{OpKind, OperationSpec};
+pub use pipeline::{CutStrategy, DesignFeature, FeatureKind, FeatureSource, Payload, PlanSettings, StockShape};
 
-pub const FILE_VERSION: u32 = 1;
+/// 2: pipeline features + stock shape (v1 files load unchanged; their operations become manual ones).
+pub const FILE_VERSION: u32 = 2;
 
 pub type Id = u64;
 
@@ -32,6 +38,9 @@ pub struct Layer {
     pub name: String,
     pub visible: bool,
     pub color: [u8; 3],
+    /// Locked layers can't be selected or edited in the viewport.
+    #[serde(default)]
+    pub locked: bool,
 }
 
 /// How a vector was made (kept so shapes stay editable / regenerable).
@@ -80,6 +89,9 @@ pub struct PartObject {
     pub id: Id,
     pub part: Part,
     pub visible: bool,
+    /// Bumped on every edit in the Solid Modeler (pipeline features record the revision they used).
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +106,11 @@ pub struct Project {
     pub meshes: Vec<MeshObject>,
     pub parts: Vec<PartObject>,
     pub operations: Vec<OperationSpec>,
+    /// The pipeline timeline (order = design order).
+    #[serde(default)]
+    pub features: Vec<DesignFeature>,
+    #[serde(default)]
+    pub stock_shape: StockShape,
     pub post_id: String,
     next_id: Id,
 }
@@ -107,12 +124,14 @@ impl Default for Project {
             job: JobSetup::default(),
             post_id: machine.post_id.clone(),
             machine,
-            layers: vec![Layer { name: "Layer 1".into(), visible: true, color: [30, 30, 30] }],
+            layers: vec![Layer { name: "Layer 1".into(), visible: true, color: [30, 30, 30], locked: false }],
             vectors: vec![],
             reliefs: vec![],
             meshes: vec![],
             parts: vec![],
             operations: vec![],
+            features: vec![],
+            stock_shape: StockShape::Rectangle,
             next_id: 1,
         }
     }
@@ -200,9 +219,29 @@ impl Project {
             );
         }
         s += &format!("{} reliefs, {} meshes, {} parts.\n", self.reliefs.len(), self.meshes.len(), self.parts.len());
+        s += &format!("{} pipeline features:\n", self.features.len());
+        for f in &self.features {
+            s += &format!(
+                "  #{} '{}' {} from {} rev {}{}\n",
+                f.id,
+                f.name,
+                f.kind.label(),
+                f.source.label(),
+                f.revision,
+                if f.suppressed { " (suppressed)" } else { "" }
+            );
+        }
         s += &format!("{} operations:\n", self.operations.len());
         for o in &self.operations {
-            s += &format!("  #{} '{}' {} tool={} enabled={}\n", o.id, o.name, o.kind.label(), o.tool_id, o.enabled);
+            s += &format!(
+                "  #{} '{}' {} tool={} enabled={}{}\n",
+                o.id,
+                o.name,
+                o.kind.label(),
+                o.tool_id,
+                o.enabled,
+                o.feature_id.map(|f| format!(" feature={f}{}", if o.auto { " (auto)" } else { "" })).unwrap_or_default()
+            );
         }
         s
     }

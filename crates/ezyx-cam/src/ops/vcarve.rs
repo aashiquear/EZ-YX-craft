@@ -9,7 +9,7 @@
 //!
 //! When `flat_depth` is set the depth is capped and the remaining flat floor is cleared either by
 //! the V-bit itself (offset passes at V-width stepover) or by a separate clearance tool (returned
-//! as a second toolpath so the user can see/run it separately — exactly like other carving suites).
+//! as a separate first toolpath so the user can see/run it separately — exactly like other carving suites).
 //!
 //! A medial-axis (Voronoi) tracer that emits only the centreline passes is on the roadmap; it cuts
 //! the same surface faster. This method was chosen first because it is robust on any input,
@@ -88,7 +88,8 @@ pub fn generate(name: &str, vectors: &[Polyline], p: &CutParams, opt: &VCarveOpt
         let mut cp = cp.clone();
         cp.cut_depth = limit + p.start_depth;
         let tp = pocket::generate_region(&format!("{name} (clearance)"), &floor.offset(cp.tool.radius() * 0.9), &cp, &PocketOptions::default());
-        out.push(tp);
+        // Clear the floor first (roughing), then the V-bit finishes walls and corners.
+        out.insert(0, tp);
     }
     out
 }
