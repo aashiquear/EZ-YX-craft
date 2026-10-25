@@ -160,6 +160,218 @@ pub fn defaults_for(t: Tier) -> PerfDefaults {
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// Rendering safety: adapter choice, CPU (software) fallback and buffer budgets
+
+/// How the user wants the viewport rendered (Settings › Graphics, or `EZYX_RENDER=auto|gpu|cpu`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RenderMode {
+    /// Best compatible GPU; software rendering only when no GPU is usable.
+    #[default]
+    Auto,
+    /// Always a hardware GPU, even one with low limits (warnings only).
+    Gpu,
+    /// Software rasteriser (Mesa llvmpipe/lavapipe, Microsoft WARP): slow but always works.
+    Cpu,
+}
+
+impl RenderMode {
+    pub fn from_env() -> Option<Self> {
+        match std::env::var("EZYX_RENDER").ok()?.to_ascii_lowercase().as_str() {
+            "auto" => Some(RenderMode::Auto),
+            "gpu" => Some(RenderMode::Gpu),
+            "cpu" | "software" => Some(RenderMode::Cpu),
+            _ => None,
+        }
+    }
+}
+
+/// What we know about an adapter before creating a device (filled from `wgpu` in [`facts`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdapterFacts {
+    pub name: String,
+    pub vendor: Vendor,
+    /// `true` for software rasterisers (`wgpu::DeviceType::Cpu`).
+    pub software: bool,
+    pub discrete: bool,
+    pub backend: String,
+    pub max_buffer_size: u64,
+    pub max_texture_2d: u32,
+    pub compute: bool,
+    /// Can present to the app's window (`None` = unknown).
+    pub surface_ok: Option<bool>,
+}
+
+/// Smallest limits the app needs for a usable viewport.
+pub const MIN_BUFFER_BYTES: u64 = 64 << 20;
+pub const MIN_TEXTURE_2D: u32 = 4096;
+
+/// Why an adapter can't be used for the viewport (`None` = fine).
+pub fn incompatibility(f: &AdapterFacts) -> Option<String> {
+    if f.surface_ok == Some(false) {
+        return Some(format!("{} can't present to this window", f.name));
+    }
+    if f.max_buffer_size < MIN_BUFFER_BYTES {
+        return Some(format!("{}: buffers limited to {} MiB (need {} MiB)", f.name, f.max_buffer_size >> 20, MIN_BUFFER_BYTES >> 20));
+    }
+    if f.max_texture_2d < MIN_TEXTURE_2D {
+        return Some(format!("{}: textures limited to {} px (need {MIN_TEXTURE_2D})", f.name, f.max_texture_2d));
+    }
+    None
+}
+
+/// The adapter to render with, and what the user should be told about it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdapterChoice {
+    pub index: usize,
+    pub software: bool,
+    pub warnings: Vec<String>,
+}
+
+/// Pick the rendering adapter. Hardware GPUs that meet the minimum limits win (best tier, then
+/// discrete); if none does — no GPU, an incompatible one, or the driver only exposes a software
+/// rasteriser — fall back to the CPU renderer with a warning. Pure, unit-tested.
+pub fn choose_adapter(adapters: &[AdapterFacts], mode: RenderMode) -> Option<AdapterChoice> {
+    let tier = |f: &AdapterFacts| classify(f.vendor, &f.name).1;
+    let score = |f: &AdapterFacts| (tier(f), f.backend != "Gl", f.discrete, f.compute);
+    let hardware: Vec<usize> = (0..adapters.len()).filter(|i| !adapters[*i].software).collect();
+    let software: Vec<usize> = (0..adapters.len()).filter(|i| adapters[*i].software && adapters[*i].surface_ok != Some(false)).collect();
+    let best = |ids: &[usize]| ids.iter().copied().max_by(|a, b| score(&adapters[*a]).cmp(&score(&adapters[*b])));
+    let mut warnings = Vec::new();
+    let pick_soft = |mut warnings: Vec<String>| -> Option<AdapterChoice> {
+        let i = best(&software)?;
+        warnings.push(format!("Using CPU (software) rendering on {}: the 3D view is slower and previews are simplified.", adapters[i].name));
+        Some(AdapterChoice { index: i, software: true, warnings })
+    };
+    if mode == RenderMode::Cpu {
+        warnings.push("CPU rendering is selected (Settings › Graphics or EZYX_RENDER=cpu).".into());
+        return pick_soft(warnings.clone()).or_else(|| {
+            // No software rasteriser installed: run on the GPU anyway rather than not at all.
+            let i = best(&hardware)?;
+            Some(AdapterChoice {
+                index: i,
+                software: false,
+                warnings: vec![format!("No software renderer found (install Mesa llvmpipe/lavapipe); using {}.", adapters[i].name)],
+            })
+        });
+    }
+    let ok: Vec<usize> = hardware.iter().copied().filter(|i| incompatibility(&adapters[*i]).is_none()).collect();
+    for i in &hardware {
+        if let Some(why) = incompatibility(&adapters[*i]) {
+            warnings.push(format!("Skipping GPU {why}."));
+        }
+    }
+    let chosen = match (best(&ok), mode) {
+        (Some(i), _) => Some(i),
+        // Forced GPU: take the best hardware adapter even if it is under the limits.
+        (None, RenderMode::Gpu) => best(&hardware.iter().copied().filter(|i| adapters[*i].surface_ok != Some(false)).collect::<Vec<_>>()),
+        (None, _) => None,
+    };
+    match chosen {
+        Some(i) => {
+            let f = &adapters[i];
+            if f.backend == "Gl" && tier(f) > Tier::Legacy {
+                warnings.push(format!("{}: the driver only offers OpenGL — install the vendor's Vulkan/DirectX driver for full speed.", f.name));
+            }
+            if incompatibility(f).is_some() {
+                warnings.push(format!("{} is below the recommended limits; previews are simplified.", f.name));
+            }
+            Some(AdapterChoice { index: i, software: false, warnings })
+        }
+        None => {
+            if hardware.is_empty() {
+                warnings.push("No GPU driver found (the system fell back to a software renderer).".into());
+            }
+            pick_soft(warnings)
+        }
+    }
+}
+
+/// Memory budgets that keep the CPU-tessellated viewport inside the GPU's buffer limit (egui
+/// uploads every frame's triangles into one vertex buffer: 3 × 20-byte vertices per triangle).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RenderBudget {
+    /// Largest single GPU buffer (bytes) on the device.
+    pub max_buffer_bytes: u64,
+    /// Vertices one window may emit per frame for meshes, lines and toolpaths together (egui
+    /// vertices are 20 bytes; 30 % of the buffer is left for the UI itself).
+    pub frame_vertices: usize,
+    /// Triangles one window may draw per frame (all meshes together).
+    pub frame_triangles: usize,
+    /// Triangles for the simulated-result preview mesh.
+    pub preview_triangles: usize,
+    /// Triangles for any other single mesh (models, reliefs, parts).
+    pub mesh_triangles: usize,
+    /// Z-map cells the material-removal simulation may allocate.
+    pub sim_max_cells: usize,
+}
+
+/// Vertex-buffer bytes per displayed triangle (3 unshared 20-byte egui vertices).
+pub const BYTES_PER_TRIANGLE: u64 = 60;
+/// Bytes per egui vertex.
+pub const BYTES_PER_VERTEX: u64 = 20;
+/// Vertices egui needs for one anti-aliased line segment (conservative).
+pub const VERTICES_PER_SEGMENT: usize = 6;
+
+pub fn render_budget(max_buffer_bytes: u64, software: bool, tier: Tier) -> RenderBudget {
+    let frame_vertices = ((max_buffer_bytes * 7 / 10 / BYTES_PER_VERTEX) as usize).max(30_000);
+    // Meshes may use half of the vertex budget, lines and toolpaths the rest.
+    let by_buffer = frame_vertices / 2 / 3;
+    // CPU tessellation (and software rasterising) cost also caps what's sensible.
+    let by_speed = match (software, tier) {
+        (true, _) | (_, Tier::None) => 400_000,
+        (_, Tier::Legacy) => 1_000_000,
+        (_, Tier::Capable) => 2_500_000,
+        (_, Tier::Modern) => 4_000_000,
+    };
+    let frame = by_buffer.min(by_speed).max(5_000);
+    let sim_max_cells = match (software, tier) {
+        (true, _) | (_, Tier::None) => 8_000_000,
+        (_, Tier::Legacy) => 16_000_000,
+        _ => 40_000_000,
+    };
+    RenderBudget { max_buffer_bytes, frame_vertices, frame_triangles: frame, preview_triangles: frame * 6 / 10, mesh_triangles: frame * 4 / 10, sim_max_cells }
+}
+
+impl RenderBudget {
+    /// After an out-of-memory / oversize-buffer error: halve everything (never below a floor).
+    pub fn reduced(self) -> Self {
+        let f = (self.frame_triangles / 2).max(5_000);
+        RenderBudget {
+            frame_vertices: (self.frame_vertices / 2).max(30_000),
+            frame_triangles: f,
+            preview_triangles: f * 6 / 10,
+            mesh_triangles: f * 4 / 10,
+            sim_max_cells: (self.sim_max_cells / 2).max(2_000_000),
+            ..self
+        }
+    }
+}
+
+/// Facts about every adapter wgpu can see (used by the app's adapter selector).
+#[cfg(feature = "wgpu")]
+pub fn facts(adapters: &[wgpu::Adapter], surface: Option<&wgpu::Surface<'_>>) -> Vec<AdapterFacts> {
+    adapters
+        .iter()
+        .map(|a| {
+            let info = a.get_info();
+            let limits = a.limits();
+            let software = info.device_type == wgpu::DeviceType::Cpu || info.name.to_ascii_lowercase().contains("llvmpipe");
+            AdapterFacts {
+                name: info.name.clone(),
+                vendor: if software { Vendor::Software } else { Vendor::from_pci(info.vendor) },
+                software,
+                discrete: info.device_type == wgpu::DeviceType::DiscreteGpu,
+                backend: format!("{:?}", info.backend),
+                max_buffer_size: limits.max_buffer_size,
+                max_texture_2d: limits.max_texture_dimension_2d,
+                compute: a.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS),
+                surface_ok: surface.map(|s| a.is_surface_supported(s)),
+            }
+        })
+        .collect()
+}
+
 /// Map `EZYX_GPU_BACKEND` to wgpu's `WGPU_BACKEND` before the window is created.
 pub fn apply_backend_override() -> Option<String> {
     let v = std::env::var("EZYX_GPU_BACKEND").ok()?;
@@ -236,6 +448,75 @@ mod tests {
         assert_eq!(classify(Vendor::Intel, "Intel(R) Arc(TM) A770").0, Family::IntelXeArc);
         assert_eq!(classify(Vendor::Apple, "Apple M2").1, Tier::Modern);
     }
+    fn hw(name: &str, vendor: Vendor, backend: &str, buf_mib: u64) -> AdapterFacts {
+        AdapterFacts {
+            name: name.into(),
+            vendor,
+            software: false,
+            discrete: true,
+            backend: backend.into(),
+            max_buffer_size: buf_mib << 20,
+            max_texture_2d: 16384,
+            compute: true,
+            surface_ok: Some(true),
+        }
+    }
+    fn llvmpipe() -> AdapterFacts {
+        AdapterFacts {
+            name: "llvmpipe (LLVM 17, 256 bits)".into(),
+            vendor: Vendor::Software,
+            software: true,
+            discrete: false,
+            ..hw("", Vendor::Software, "Vulkan", 2048)
+        }
+    }
+
+    #[test]
+    fn adapter_choice_and_fallbacks() {
+        // Best compatible GPU wins over the software renderer and a weaker GPU.
+        let a = [llvmpipe(), hw("Intel(R) UHD Graphics 620", Vendor::Intel, "Vulkan", 2048), hw("NVIDIA GeForce RTX 3060", Vendor::Nvidia, "Vulkan", 4096)];
+        let c = choose_adapter(&a, RenderMode::Auto).unwrap();
+        assert_eq!((c.index, c.software), (2, false));
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+        // A GPU with tiny buffers is incompatible → CPU fallback with an explanation.
+        let a = [hw("Old GPU", Vendor::Other, "Gl", 16), llvmpipe()];
+        let c = choose_adapter(&a, RenderMode::Auto).unwrap();
+        assert!(c.software && c.index == 1);
+        assert!(c.warnings.iter().any(|w| w.contains("16 MiB")) && c.warnings.iter().any(|w| w.contains("CPU (software) rendering")), "{:?}", c.warnings);
+        // …unless the user forces the GPU.
+        let c = choose_adapter(&a, RenderMode::Gpu).unwrap();
+        assert!(!c.software && c.index == 0 && c.warnings.iter().any(|w| w.contains("below the recommended")));
+        // Driver fell back to software only.
+        let c = choose_adapter(&[llvmpipe()], RenderMode::Auto).unwrap();
+        assert!(c.software && c.warnings.iter().any(|w| w.contains("No GPU driver")));
+        // Modern GPU exposed only through OpenGL: usable, but the driver is flagged.
+        let c = choose_adapter(&[hw("AMD Radeon RX 6800", Vendor::Amd, "Gl", 2048)], RenderMode::Auto).unwrap();
+        assert!(c.warnings.iter().any(|w| w.contains("only offers OpenGL")));
+        // CPU mode picks the software renderer even when a GPU exists.
+        let a = [hw("NVIDIA GeForce RTX 3060", Vendor::Nvidia, "Vulkan", 4096), llvmpipe()];
+        assert!(choose_adapter(&a, RenderMode::Cpu).unwrap().software);
+        assert!(choose_adapter(&[], RenderMode::Auto).is_none());
+    }
+
+    #[test]
+    fn budgets_fit_the_buffer_limit() {
+        // The reported crash: a 321 MB vertex buffer on a device limited to 256 MiB.
+        let b = render_budget(256 << 20, false, Tier::Modern);
+        // Everything we draw stays within 70 % of the buffer; meshes within half of that.
+        assert!(b.frame_vertices as u64 * BYTES_PER_VERTEX <= (256 << 20) * 7 / 10);
+        assert!(b.frame_triangles * 3 <= b.frame_vertices / 2);
+        assert!(b.preview_triangles + b.mesh_triangles <= b.frame_triangles);
+        assert_eq!(b.frame_triangles, 1_565_873);
+        // A tiny (8 MiB) device still gets a usable, safe budget.
+        let t = render_budget(8 << 20, false, Tier::Capable);
+        assert!(t.frame_vertices as u64 * BYTES_PER_VERTEX <= 8 << 20);
+        let s = render_budget(2 << 30, true, Tier::None);
+        assert_eq!(s.frame_triangles, 400_000);
+        let r = b.reduced();
+        assert_eq!(r.frame_triangles, b.frame_triangles / 2);
+        assert!(r.sim_max_cells < b.sim_max_cells);
+    }
+
     #[test]
     fn probe_does_not_panic() {
         // Headless CI may have zero adapters; just make sure enumeration is safe.

@@ -170,7 +170,9 @@ fn preview(app: &mut EzApp, ui: &mut Ui) {
     let running = m.running_job == m.selected_job && m.progress.1 > 0;
     let done_line = if running { (m.progress.0 as f64 / m.progress.1.max(1) as f64 * j.lines() as f64) as usize } else { 0 };
     let depth = (-j.min[2]).max(0.1);
-    let stride = (j.moves.len() / 120_000).max(1);
+    // Stay inside the window's GPU vertex budget (and keep huge programs responsive).
+    let granted = crate::gpu_guard::take_segments(ui.ctx(), j.moves.len().min(120_000));
+    let stride = j.moves.len().div_ceil(granted.max(1)).max(1);
     for (i, mv) in j.moves.iter().enumerate() {
         if mv.rapid {
             if i % stride == 0 {

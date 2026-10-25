@@ -946,6 +946,29 @@
       ]
     },
     {
+      "id": "settings.graphics",
+      "module": "settings",
+      "title": "Graphics: GPU checks and CPU fallback",
+      "summary": "At start-up EZ-YX-craft checks the graphics adapters. GPUs that can't run the viewport (no driver, tiny buffer or texture limits, can't draw to the window) are skipped, and if none is usable the app renders on the CPU instead and tells you why. While you work, previews are sized to the GPU's buffer limit; if the GPU still runs out of memory the app simplifies the view and offers to restart with CPU rendering instead of crashing.",
+      "how_to": [
+        "If a ⚠ Graphics message appears, read why and choose Restart with CPU rendering or OK.",
+        "File › ⚙ Settings › Graphics shows the adapter in use and its limits.",
+        "Choose Render with Auto, GPU or CPU and click Restart now (or start with EZYX_RENDER=cpu)."
+      ],
+      "since": "0.2.0",
+      "shots": [],
+      "chapter": "settings.md",
+      "keywords": [
+        "gpu",
+        "graphics",
+        "driver",
+        "cpu rendering",
+        "software",
+        "out of memory",
+        "crash"
+      ]
+    },
+    {
       "id": "settings.general",
       "module": "settings",
       "title": "Units, theme & performance",

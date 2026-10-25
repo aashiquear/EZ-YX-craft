@@ -11,7 +11,7 @@
 use crate::ribbon::{self, Action, Align, DrawTool, Module, OpTemplate, PassFilter, Step};
 use crate::tasks::{TaskResult, Tasks};
 use crate::viewport::{Camera, ViewPreset};
-use crate::{docshots, image_studio, machine_control, panels, pipeline, solid, theme};
+use crate::{docshots, gpu_guard, image_studio, machine_control, panels, pipeline, solid, theme};
 use egui::RichText;
 use ezyx_cam::ops::{
     pocket::PocketOptions,
@@ -64,12 +64,24 @@ pub struct Prefs {
     pub snap_grid: bool,
     pub grid: f64,
     pub snap_objects: bool,
+    /// Viewport rendering: best GPU, forced GPU, or CPU (software) rasteriser.
+    pub render_mode: ezyx_gpu::RenderMode,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { separate_windows: true, dark: false, snap_grid: true, grid: 0.5, snap_objects: true }
+        Self { separate_windows: true, dark: false, snap_grid: true, grid: 0.5, snap_objects: true, render_mode: ezyx_gpu::RenderMode::Auto }
     }
+}
+
+/// Something about the graphics setup the user should know (start-up fallback, runtime error).
+#[derive(Debug, Clone)]
+pub struct GpuNotice {
+    pub title: String,
+    pub lines: Vec<String>,
+    /// Offer "restart with CPU rendering" (we're not already on the CPU renderer).
+    pub offer_cpu: bool,
+    pub remember: bool,
 }
 
 impl Prefs {
@@ -114,6 +126,15 @@ pub struct EzApp {
     pub tasks: Tasks,
     pub gpu: Option<ezyx_gpu::GpuInfo>,
     pub perf: ezyx_gpu::PerfDefaults,
+    /// Buffer/triangle/memory budgets for the device actually in use (shrinks after GPU errors).
+    pub budget: ezyx_gpu::RenderBudget,
+    /// The adapter in use and why it was chosen.
+    pub graphics: gpu_guard::StartupReport,
+    pub gpu_notice: Option<GpuNotice>,
+    /// A mesh had to be thinned to fit this frame's GPU budget.
+    pub simplified: bool,
+    /// Project revision and time of the last recovery autosave.
+    autosaved: (u64, std::time::Instant),
     pub draw: DrawState,
     pub dialogs: Dialogs,
     pub image: image_studio::Studio,
@@ -148,7 +169,51 @@ impl EzApp {
         let prefs = Prefs::load();
         theme::apply(&cc.egui_ctx, prefs.dark);
         let gpu = ezyx_gpu::best();
-        let perf = ezyx_gpu::defaults_for(gpu.as_ref().map(|g| g.tier).unwrap_or(ezyx_gpu::Tier::Capable));
+        // Budgets come from the device eframe actually created (see `gpu_guard::wgpu_options`).
+        let mut graphics = gpu_guard::startup().unwrap_or_default();
+        let (max_buffer, software, tier) = match &cc.wgpu_render_state {
+            Some(rs) => {
+                gpu_guard::install(&rs.device);
+                let info = rs.adapter.get_info();
+                let software = graphics.software || info.device_type == eframe::wgpu::DeviceType::Cpu;
+                let vendor = if software { ezyx_gpu::Vendor::Software } else { ezyx_gpu::Vendor::from_pci(info.vendor) };
+                let (_, mut tier, _) = ezyx_gpu::classify(vendor, &info.name);
+                if info.backend == eframe::wgpu::Backend::Gl {
+                    tier = tier.min(ezyx_gpu::Tier::Legacy);
+                }
+                if graphics.adapter.is_empty() {
+                    graphics.adapter = info.name.clone();
+                    graphics.backend = format!("{:?}", info.backend);
+                    graphics.software = software;
+                }
+                (rs.device.limits().max_buffer_size, software, tier)
+            }
+            None => (256 << 20, true, ezyx_gpu::Tier::None),
+        };
+        let mut budget = ezyx_gpu::render_budget(max_buffer, software, tier);
+        let mut perf = ezyx_gpu::defaults_for(if software { ezyx_gpu::Tier::None } else { tier });
+        // Testing / power-user overrides.
+        if let Some(n) = std::env::var("EZYX_FRAME_BUDGET").ok().and_then(|v| v.parse::<usize>().ok()) {
+            budget.frame_triangles = n;
+            budget.frame_vertices = n * 6;
+            budget.preview_triangles = n * 6 / 10;
+            budget.mesh_triangles = n * 4 / 10;
+        }
+        if let Some(c) = std::env::var("EZYX_SIM_CELL").ok().and_then(|v| v.parse::<f64>().ok()) {
+            perf.sim_cell_mm = c;
+        }
+        gpu_guard::set_frame_budget(budget.frame_vertices);
+        let mut notice_lines = graphics.warnings.clone();
+        if let Ok(e) = std::env::var("EZYX_GPU_FAILED") {
+            notice_lines.retain(|l| !l.starts_with("CPU rendering is selected"));
+            notice_lines.insert(0, format!("The GPU renderer failed ({e}), so EZ-YX-craft restarted with CPU rendering and reopened your work."));
+        }
+        let gpu_notice = (!notice_lines.is_empty()).then(|| GpuNotice {
+            title: "Graphics".into(),
+            lines: notice_lines,
+            offer_cpu: !software && graphics.mode != ezyx_gpu::RenderMode::Gpu,
+            remember: false,
+        });
         let docs = docshots::DocShots::from_env();
         let mut app = Self {
             project: Project::default(),
@@ -177,6 +242,11 @@ impl EzApp {
             tasks: Tasks::default(),
             gpu,
             perf,
+            budget,
+            graphics,
+            gpu_notice,
+            simplified: false,
+            autosaved: (0, std::time::Instant::now()),
             draw: DrawState::default(),
             dialogs: Dialogs {
                 about: false,
@@ -208,6 +278,7 @@ impl EzApp {
             theme::apply(&cc.egui_ctx, false);
             app.perf.sim_cell_mm = 0.25;
             app.perf.viewport_lod = 1;
+            app.gpu_notice = None;
         }
         // Open a project passed on the command line (also used by OS file associations).
         if let Some(path) = std::env::args().nth(1).filter(|a| !a.starts_with('-')).map(PathBuf::from) {
@@ -259,7 +330,13 @@ impl EzApp {
             Ok(p) => {
                 self.project = p;
                 self.history = History::default();
-                self.path = Some(path.to_path_buf());
+                // A recovery copy is not the user's file: make them "Save As".
+                let recovered = path.file_name().map(|f| f == "recovery.ezyx").unwrap_or(false);
+                self.path = (!recovered).then(|| path.to_path_buf());
+                if !recovered {
+                    // Until the first autosave, a GPU restart reopens the file itself.
+                    gpu_guard::set_recovery_path(path.to_path_buf());
+                }
                 self.selection.clear();
                 self.selected_feature = None;
                 self.selected_op = None;
@@ -269,7 +346,11 @@ impl EzApp {
                 self.touch();
                 self.fit_view();
                 self.calculate(None);
-                self.status = format!("Opened {}", path.display());
+                self.status = if recovered {
+                    "Recovered your project after restarting the renderer — use File › Save as… to keep it.".into()
+                } else {
+                    format!("Opened {}", path.display())
+                };
             }
             Err(e) => self.status = format!("⚠ could not open {}: {e}", path.display()),
         }
@@ -422,8 +503,12 @@ impl EzApp {
     pub fn simulate(&mut self, ctx: &egui::Context, final_render: bool) {
         let p = self.project.clone();
         let lib = self.library.clone();
-        let cell = self.perf.sim_cell_mm.max(0.08);
+        let wanted = self.perf.sim_cell_mm.max(0.08);
+        // Memory guard: coarsen the Z-map rather than allocate gigabytes on big stock.
+        let cell = ezyx_sim::cell_for_budget(&self.project.job, wanted, self.budget.sim_max_cells);
+        let coarsened = (cell > wanted + 1e-9).then(|| format!("Simulation coarsened from {wanted:.2} to {cell:.2} mm to stay within memory"));
         let lod = self.perf.viewport_lod;
+        let max_tris = self.budget.preview_triangles;
         let filter = if final_render { PassFilter::Both } else { self.passes };
         self.status = format!("Simulating {} at {cell:.2} mm resolution…", if final_render { "the finished piece" } else { "the shown passes" });
         self.tasks.spawn(ctx, move || {
@@ -445,18 +530,15 @@ impl EzApp {
                 }
             }
             let mat = ezyx_materials::find(&p.job.material).unwrap_or_else(|| ezyx_materials::library()[0].clone());
-            let lod = lod.max((sim.hm.width.max(sim.hm.height) / 900).max(1));
+            // Display mesh sized to the GPU budget (the full-resolution Z-map is still what was cut).
+            let lod = sim.lod_for_budget(max_tris, lod);
             let mut mesh = sim.render_mesh(&mat, lod);
+            let mut warnings = sim.warnings.clone();
+            warnings.extend(coarsened);
             if let Some(d) = rotary {
                 ezyx_sim::wrap_mesh_cylinder(&mut mesh, d as f32 * 0.5);
             }
-            TaskResult::Simulation {
-                mesh,
-                removed_cm3: sim.removed_volume() / 1000.0,
-                warnings: sim.warnings.clone(),
-                seconds: t0.elapsed().as_secs_f64(),
-                final_render,
-            }
+            TaskResult::Simulation { mesh, removed_cm3: sim.removed_volume() / 1000.0, warnings, seconds: t0.elapsed().as_secs_f64(), final_render }
         });
     }
 
@@ -488,6 +570,85 @@ impl EzApp {
                 TaskResult::Studio(r) => self.image.on_result(r),
                 TaskResult::Error(e) => self.status = format!("⚠ {e}"),
             }
+        }
+    }
+
+    /// React to GPU errors reported by `gpu_guard` instead of crashing: shrink the budgets,
+    /// simplify what is on screen, keep a recovery copy after device loss, tell the user.
+    fn poll_gpu(&mut self) {
+        self.simplified = gpu_guard::take_exceeded();
+        // Keep a recovery copy (at most once a minute, only after changes) so a GPU restart —
+        // or a crash we couldn't prevent — loses at most a minute of work.
+        let first = self.autosaved.0 == 0 && self.rev > 1;
+        if self.docs.is_none() && self.autosaved.0 != self.rev && (first || self.autosaved.1.elapsed().as_secs() >= 60) {
+            if let Ok(p) = self.save_recovery() {
+                gpu_guard::set_recovery_path(p);
+            }
+            self.autosaved = (self.rev, std::time::Instant::now());
+        }
+        let mut lines = Vec::new();
+        for e in gpu_guard::drain() {
+            let msg = e.message();
+            self.status = format!("⚠ {msg}");
+            lines.push(msg);
+            if e.is_memory() {
+                self.budget = self.budget.reduced();
+                gpu_guard::set_frame_budget(self.budget.frame_vertices);
+                if let Some(p) = self.preview.take() {
+                    self.preview = Some(p.decimated(self.budget.preview_triangles));
+                }
+                self.display.clear();
+                self.solid.clear_display();
+                lines.push(format!("Previews were simplified to fit the GPU's memory ({} triangles per frame now).", self.budget.frame_triangles));
+            }
+            if matches!(e, gpu_guard::GpuEvent::DeviceLost(_)) {
+                lines.push(match self.save_recovery() {
+                    Ok(p) => format!("Your project was saved to {} — restart to continue.", p.display()),
+                    Err(err) => format!("Could not save a recovery copy: {err}"),
+                });
+            }
+        }
+        if lines.is_empty() {
+            return;
+        }
+        let offer_cpu = !self.graphics.software;
+        let n = self.gpu_notice.get_or_insert_with(|| GpuNotice {
+            title: "Graphics problem — EZ-YX-craft kept running".into(),
+            lines: vec![],
+            offer_cpu,
+            remember: false,
+        });
+        for l in lines {
+            if !n.lines.contains(&l) && n.lines.len() < 10 {
+                n.lines.push(l);
+            }
+        }
+    }
+
+    /// Copy of the current project in the config dir (used before restarting the renderer).
+    pub fn save_recovery(&self) -> Result<PathBuf, String> {
+        let dir = dirs::config_dir().ok_or("no config directory")?.join("ezyx-craft");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let p = dir.join("recovery.ezyx");
+        self.project.save(&p).map_err(|e| e.to_string())?;
+        Ok(p)
+    }
+
+    /// Restart the app with another renderer, reopening the current project.
+    pub fn restart_renderer(&mut self, mode: ezyx_gpu::RenderMode, remember: bool, ctx: &egui::Context) {
+        if remember {
+            self.prefs.render_mode = mode;
+            self.prefs.save();
+        }
+        let project = match self.save_recovery() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                self.status = format!("⚠ {e}");
+                self.path.clone()
+            }
+        };
+        if let Err(e) = gpu_guard::restart(mode, project.as_deref(), ctx) {
+            self.status = format!("⚠ could not restart: {e}");
         }
     }
 
@@ -1042,6 +1203,44 @@ impl EzApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(mut n) = self.gpu_notice.clone() {
+            let mut keep = true;
+            let mut restart = false;
+            egui::Window::new(format!("⚠ {}", n.title)).collapsible(false).resizable(false).anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -40.0]).show(
+                ctx,
+                |ui| {
+                    ui.set_max_width(460.0);
+                    for l in &n.lines {
+                        ui.label(l);
+                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "Rendering on {} ({}){}.",
+                            self.graphics.adapter,
+                            self.graphics.backend,
+                            if self.graphics.software { ", CPU" } else { "" }
+                        ))
+                        .small()
+                        .color(theme::STEEL),
+                    );
+                    ui.horizontal(|ui| {
+                        if n.offer_cpu {
+                            if ui.button(RichText::new("Restart with CPU rendering").strong()).on_hover_text(ribbon::tip("settings.graphics")).clicked() {
+                                restart = true;
+                            }
+                            ui.checkbox(&mut n.remember, "always");
+                        }
+                        if ui.button("OK").clicked() {
+                            keep = false;
+                        }
+                    });
+                },
+            );
+            if restart {
+                self.restart_renderer(ezyx_gpu::RenderMode::Cpu, n.remember, ctx);
+            }
+            self.gpu_notice = keep.then_some(n);
+        }
         if self.dialogs.about {
             egui::Window::new("About EZ-YX-craft").collapsible(false).resizable(false).open(&mut self.dialogs.about).show(ctx, |ui| {
                 ui.heading(RichText::new("EZ-YX-craft").color(theme::ACCENT));
@@ -1063,7 +1262,47 @@ impl EzApp {
         if self.dialogs.settings {
             let mut open = true;
             let mut changed = false;
+            let mut restart: Option<ezyx_gpu::RenderMode> = None;
             egui::Window::new("Settings").collapsible(false).open(&mut open).show(ctx, |ui| {
+                ui.label(RichText::new("Graphics").strong()).on_hover_text(ribbon::tip("settings.graphics"));
+                ui.label(format!(
+                    "{} · {} · {}",
+                    self.graphics.adapter,
+                    self.graphics.backend,
+                    if self.graphics.software { "CPU (software) rendering" } else { "GPU rendering" }
+                ));
+                ui.label(
+                    RichText::new(format!(
+                        "Largest GPU buffer {} MiB · up to {} triangles per frame · simulation up to {} M cells",
+                        self.budget.max_buffer_bytes >> 20,
+                        self.budget.frame_triangles,
+                        self.budget.sim_max_cells / 1_000_000
+                    ))
+                    .small()
+                    .color(theme::STEEL),
+                );
+                let before = self.prefs.render_mode;
+                ui.horizontal(|ui| {
+                    ui.label("Render with");
+                    ui.radio_value(&mut self.prefs.render_mode, ezyx_gpu::RenderMode::Auto, "Auto")
+                        .on_hover_text("Best compatible GPU; CPU only if no GPU is usable");
+                    ui.radio_value(&mut self.prefs.render_mode, ezyx_gpu::RenderMode::Gpu, "GPU")
+                        .on_hover_text("Always the GPU, even one below the recommended limits");
+                    ui.radio_value(&mut self.prefs.render_mode, ezyx_gpu::RenderMode::Cpu, "CPU")
+                        .on_hover_text("Software renderer: slower, but works with any driver");
+                });
+                if self.prefs.render_mode != before {
+                    changed = true;
+                }
+                if self.prefs.render_mode != self.graphics.mode {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Takes effect after a restart.").small().color(theme::WARN));
+                        if ui.small_button("Restart now").clicked() {
+                            restart = Some(self.prefs.render_mode);
+                        }
+                    });
+                }
+                ui.separator();
                 ui.label(RichText::new("Windows").strong());
                 changed |= ui.radio_value(&mut self.prefs.separate_windows, true, "Open modules in separate windows (side by side)").changed();
                 changed |= ui.radio_value(&mut self.prefs.separate_windows, false, "Show modules as tabs inside the main window").changed();
@@ -1085,6 +1324,9 @@ impl EzApp {
                 if !self.prefs.separate_windows {
                     self.open.clear();
                 }
+            }
+            if let Some(m) = restart {
+                self.restart_renderer(m, true, ctx);
             }
             if !open {
                 self.dialogs.settings = false;
@@ -1187,6 +1429,7 @@ impl eframe::App for EzApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_tasks();
+        self.poll_gpu();
         if std::mem::take(&mut self.pending_preview) {
             self.step = Step::Toolpaths;
             self.simulate(&ctx, true);
@@ -1217,6 +1460,23 @@ impl eframe::App for EzApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(self.machine.badge()).color(theme::STEEL));
                     ui.separator();
+                    if self.graphics.software {
+                        if ui
+                            .add(egui::Label::new(RichText::new("⚠ CPU rendering").color(theme::WARN)).sense(egui::Sense::click()))
+                            .on_hover_text(format!("{} ({}) — click for graphics settings", self.graphics.adapter, self.graphics.backend))
+                            .clicked()
+                        {
+                            self.dialogs.settings = true;
+                        }
+                        ui.separator();
+                    }
+                    if self.simplified {
+                        ui.label(RichText::new("◇ simplified view").color(theme::STEEL)).on_hover_text(format!(
+                            "Some geometry is drawn simplified to stay within the GPU budget ({} triangles per frame).",
+                            self.budget.frame_triangles
+                        ));
+                        ui.separator();
+                    }
                     ui.label(RichText::new(format!("{} · {}", self.project.machine.name, self.project.job.material)).color(theme::STEEL));
                 });
             });

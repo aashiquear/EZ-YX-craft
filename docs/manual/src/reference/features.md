@@ -89,4 +89,5 @@ How the module windows are arranged and other preferences.
 | Feature | What it does | Since |
 |---|---|---|
 | [Module windows side by side](../settings.md#module-windows-side-by-side) | Image Studio, Solid Modeler and Machine Control open as their own windows so they can sit next to the pipeline. | 0.2.0 |
+| [Graphics: GPU checks and CPU fallback](../settings.md#graphics-gpu-checks-and-cpu-fallback) | At start-up EZ-YX-craft checks the graphics adapters. | 0.2.0 |
 | [Units, theme & performance](../settings.md#units-theme--performance) | Millimetres or inches, light or dark theme, and simulation detail (set from your GPU tier). | 0.2.0 |

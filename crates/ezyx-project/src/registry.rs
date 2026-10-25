@@ -572,6 +572,20 @@ pub fn features() -> Vec<Feature> {
             ["windows", "layout", "side by side", "tile"]
         ),
         feat!(
+            "settings.graphics",
+            "settings",
+            "settings.md",
+            "Graphics: GPU checks and CPU fallback",
+            "At start-up EZ-YX-craft checks the graphics adapters. GPUs that can't run the viewport (no driver, tiny buffer or texture limits, can't draw to the window) are skipped, and if none is usable the app renders on the CPU instead and tells you why. While you work, previews are sized to the GPU's buffer limit; if the GPU still runs out of memory the app simplifies the view and offers to restart with CPU rendering instead of crashing.",
+            [
+                "If a ⚠ Graphics message appears, read why and choose Restart with CPU rendering or OK.",
+                "File › ⚙ Settings › Graphics shows the adapter in use and its limits.",
+                "Choose Render with Auto, GPU or CPU and click Restart now (or start with EZYX_RENDER=cpu)."
+            ],
+            [],
+            ["gpu", "graphics", "driver", "cpu rendering", "software", "out of memory", "crash"]
+        ),
+        feat!(
             "settings.general",
             "settings",
             "settings.md",

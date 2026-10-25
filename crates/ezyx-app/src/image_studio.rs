@@ -442,15 +442,20 @@ fn viewer(app: &mut EzApp, ui: &mut Ui) {
     let hmm = wmm * aspect;
     let to_screen = |p: DVec2| egui::pos2(img_rect.left() + (p.x / wmm) as f32 * img_rect.width(), img_rect.bottom() - (p.y / hmm) as f32 * img_rect.height());
     if !s.show_original {
+        // GPU vertex budget for the overlay: thin out huge traces / groove sets evenly.
+        let want = s.preview.paths.iter().map(|p| p.pts.len()).sum::<usize>() + s.preview.grooves.iter().map(|g| g.len()).sum::<usize>();
+        let granted = crate::gpu_guard::take_segments(ui.ctx(), want);
+        let keep = want.div_ceil(granted.max(1)).max(1);
         for pl in &s.preview.paths {
-            let mut pts: Vec<egui::Pos2> = pl.pts.iter().map(|p| to_screen(*p)).collect();
+            let mut pts: Vec<egui::Pos2> = pl.pts.iter().step_by(keep).map(|p| to_screen(*p)).collect();
             if pl.closed && !pts.is_empty() {
                 pts.push(pts[0]);
             }
             painter.add(egui::Shape::line(pts, Stroke::new(1.4, theme::ACCENT)));
         }
         let maxd = s.img.photo.max_depth().max(1e-6);
-        for g in &s.preview.grooves {
+        for g in s.preview.grooves.iter().step_by(keep.min(4)) {
+            let g: Vec<DVec3> = g.iter().step_by((keep / 4).max(1)).copied().collect();
             for w in g.windows(2) {
                 let t = (-(w[1].z) / maxd) as f32;
                 painter.line_segment(

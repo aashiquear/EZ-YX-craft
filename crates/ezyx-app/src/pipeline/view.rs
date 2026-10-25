@@ -103,7 +103,8 @@ pub fn show(app: &mut EzApp, ui: &mut egui::Ui) {
 
     // ---- solid content (reliefs, 3D models) or the simulated result
     if let Some(m) = &app.preview {
-        d.mesh(m, [0.8, 0.7, 0.55], 255, false);
+        // Back faces (the stock bottom) are skipped on flat jobs: half the triangles to upload.
+        d.mesh(m, [0.8, 0.7, 0.55], 255, rotary.is_none());
     } else {
         let feature_of = |p: &ezyx_project::Project, pred: &dyn Fn(&ezyx_project::FeatureKind) -> bool| p.features.iter().find(|f| pred(&f.kind)).map(|f| f.id);
         let reliefs: Vec<ReliefObject> = app.project.reliefs.iter().filter(|r| r.visible).cloned().collect();
@@ -113,11 +114,21 @@ pub fn show(app: &mut EzApp, ui: &mut egui::Ui) {
             let sel = fid.is_some() && fid == app.selected_feature;
             d.mesh(&m, if sel { [0.95, 0.78, 0.55] } else { [0.85, 0.75, 0.6] }, 255, false);
         }
+        // Models over the per-mesh GPU budget are drawn from a simplified copy.
+        let budget = app.budget.mesh_triangles;
+        for m in app.project.meshes.iter().filter(|m| m.visible && m.mesh.indices.len() > budget) {
+            let key = format!("mesh{}", m.id);
+            let sig = (m.mesh.indices.len() as u64) << 32 ^ m.mesh.positions.len() as u64 ^ budget as u64;
+            if app.display.get(&key).map(|(r, _)| *r != sig).unwrap_or(true) {
+                app.display.insert(key, (sig, m.mesh.decimated(budget)));
+            }
+        }
         for m in app.project.meshes.iter().filter(|m| m.visible) {
+            let shown = app.display.get(&format!("mesh{}", m.id)).filter(|_| m.mesh.indices.len() > budget).map(|(_, d)| d).unwrap_or(&m.mesh);
             let fid = feature_of(&app.project, &|k| matches!(k, ezyx_project::FeatureKind::Model3D { mesh_id } if *mesh_id == m.id));
             let suppressed = fid.and_then(|f| app.project.features.iter().find(|x| x.id == f)).map(|f| f.suppressed).unwrap_or(false);
             let sel = fid.is_some() && fid == app.selected_feature;
-            d.mesh(&m.mesh, if sel { [0.95, 0.7, 0.45] } else { [0.75, 0.78, 0.82] }, if suppressed { 90 } else { 255 }, true);
+            d.mesh(shown, if sel { [0.95, 0.7, 0.45] } else { [0.75, 0.78, 0.82] }, if suppressed { 90 } else { 255 }, true);
         }
     }
 
@@ -244,29 +255,59 @@ fn draw_toolpaths(app: &EzApp, d: &Draw, rotary: Option<(f32, f32)>, alpha: f32)
             Vec3::new(p.x as f32, p.y as f32, p.z as f32)
         }
     };
-    let total: usize = app.results.iter().flat_map(|r| r.toolpaths.iter()).map(|t| t.moves.len()).sum();
-    let stride = (total / 250_000).max(1);
+    // Reserve this frame's GPU vertex budget for everything shown, then thin evenly to fit
+    // (decimated paths connect from the last drawn point, so nothing is left with gaps).
+    let shown = |op: &ezyx_project::OperationSpec, tp: &ezyx_cam::Toolpath| app.passes.shows(ezyx_project::pipeline::toolpath_pass(op, tp));
+    let (mut cuts, mut rapids) = (0usize, 0usize);
+    for r in &app.results {
+        let Some(op) = app.project.operations.iter().find(|o| o.id == r.op_id) else { continue };
+        for tp in r.toolpaths.iter().filter(|tp| shown(op, tp)) {
+            for (_, rapid) in tp.points() {
+                if rapid {
+                    rapids += 1;
+                } else {
+                    cuts += 1;
+                }
+            }
+        }
+    }
+    let ctx = d.painter.ctx();
+    let cut_ok = crate::gpu_guard::take_segments(ctx, cuts.min(250_000));
+    let cut_stride = cuts.div_ceil(cut_ok.max(1)).max(1);
+    // A dashed rapid costs up to ~10 segments.
+    let rapids_on = app.show_rapids && alpha > 0.5;
+    let rapid_ok = if rapids_on { crate::gpu_guard::take_segments(ctx, rapids.min(20_000) * 10) / 10 } else { 0 };
+    let rapid_stride = rapids.div_ceil(rapid_ok.max(1)).max(1);
     let fade = |c: Color32| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (255.0 * alpha) as u8);
+    let (mut nc, mut nr) = (0usize, 0usize);
     for r in &app.results {
         let Some(op) = app.project.operations.iter().find(|o| o.id == r.op_id) else { continue };
         let highlighted = app.selected_op == Some(r.op_id) || (app.selected_op.is_none() && op.feature_id.is_some() && op.feature_id == app.selected_feature);
-        for tp in r.toolpaths.iter().filter(|tp| app.passes.shows(ezyx_project::pipeline::toolpath_pass(op, tp))) {
+        for tp in r.toolpaths.iter().filter(|tp| shown(op, tp)) {
             let rough = ezyx_project::pipeline::toolpath_pass(op, tp) == ezyx_tooldb::Operation::Roughing;
-            let mut prev: Option<Vec3> = None;
-            for (i, (p, rapid)) in tp.points().enumerate() {
+            let mut last: Option<Vec3> = None;
+            for (p, rapid) in tp.points() {
                 let q = to3(&p, tp.rotary);
-                if let Some(a) = prev {
-                    if rapid {
-                        if app.show_rapids && i % stride == 0 && alpha > 0.5 {
-                            d.dashed(a, q, Stroke::new(0.7, theme::RAPID));
-                        }
-                    } else if i % stride == 0 || stride == 1 {
+                let Some(a) = last else {
+                    last = Some(q);
+                    continue;
+                };
+                if rapid {
+                    nr += 1;
+                    if rapids_on && rapid_ok > 0 && nr % rapid_stride == 0 {
+                        d.dashed_reserved(a, q, Stroke::new(0.7, theme::RAPID));
+                    }
+                    // Even when a rapid isn't drawn, the next cut starts where it ended.
+                    last = Some(q);
+                } else {
+                    nc += 1;
+                    if cut_ok > 0 && nc % cut_stride == 0 {
                         // Roughing in warm tones, finishing in the cool depth palette.
                         let c = if rough { theme::rough_color(-(p.z as f32) / maxd) } else { theme::depth_color(-(p.z as f32) / maxd) };
-                        d.line(a, q, Stroke::new(if highlighted { 1.8 } else { 1.0 }, fade(c)));
+                        d.line_reserved(a, q, Stroke::new(if highlighted { 1.8 } else { 1.0 }, fade(c)));
+                        last = Some(q);
                     }
                 }
-                prev = Some(q);
             }
         }
     }
@@ -577,7 +618,10 @@ fn relief_mesh(app: &mut EzApp, r: &ReliefObject) -> TriMesh {
             return m.clone();
         }
     }
-    let lod = (r.heightmap.width.max(r.heightmap.height) / 400).max(1);
+    // ~2 triangles per displayed cell: pick the step that fits the per-mesh GPU budget.
+    let cells = (r.heightmap.width * r.heightmap.height) as f64;
+    let by_budget = (2.0 * cells / app.budget.mesh_triangles.max(1) as f64).sqrt().ceil() as usize;
+    let lod = (r.heightmap.width.max(r.heightmap.height) / 400).max(by_budget).max(1);
     let m = ezyx_mesh::hm::surface(&r.heightmap, lod);
     app.display.insert(key, (app.rev, m.clone()));
     m

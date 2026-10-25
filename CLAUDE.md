@@ -37,10 +37,10 @@ Owner: Aashique (machine: Genmitsu 4040 PRO MAX with Wi-Fi module; dev box: Ubun
 | ezyx-mesh | TriMesh, STL/OBJ, marching tets, tet meshing + quality, img→3D backends | `mt::extract`, `tet::relief_solid`, `tet::from_sdf` |
 | ezyx-cad | SDF feature-tree part modeller: constrained sketches (LM solver), params/expressions/configurations, extrude/revolve/sweep/loft/holes/threads, patterns, split/combine, mass props, templates | `Part::{sdf,mesh,heightmap,resolved}`, `sketch::Sketch::solve_with`, `expr::eval`, `templates()` |
 | ezyx-sim | Z-map material removal, preview mesh, machining advice | `StockSim`, `advise` |
-| ezyx-gpu | wgpu adapter probe + GPU family/tier classification | `probe`, `classify`, `defaults_for` |
+| ezyx-gpu | wgpu adapter probe, GPU family/tier classification, adapter choice + render budgets | `probe`, `classify`, `choose_adapter`, `render_budget` |
 | ezyx-ai | Anthropic/OpenAI/OpenAI-compatible providers, tool-use agent loop | `Agent::run_turn`, `ToolHost` |
 | ezyx-project | Project doc, Commands/History, **pipeline** (features timeline, auto-planner, conflicts, re-import merge), job sheet, **feature registry** (GUI tooltips + manual), demo project, machine profiles, op pipeline, AI tool host, SVG/DXF import, text | `pipeline::{plan_feature,replan,reimport,analyze}`, `registry::registry`, `ops::export_gcode` |
-| ezyx-app | egui/eframe GUI (binary `ez-yx-craft`): pipeline main window + module windows | `app.rs` (shell, actions, windows), `pipeline/*`, `image_studio.rs`, `solid/*`, `machine_control.rs`, `docshots.rs` |
+| ezyx-app | egui/eframe GUI (binary `ez-yx-craft`): pipeline main window + module windows | `app.rs` (shell, actions, windows), `pipeline/*`, `image_studio.rs`, `solid/*`, `machine_control.rs`, `gpu_guard.rs`, `docshots.rs` |
 | ezyx-cli | headless CLI (binary `ezyx`) | `main.rs` subcommands |
 
 ## Commands
@@ -92,7 +92,7 @@ Serial uses `serialport` with default features off (no libudev needed).
 Working & tested: geometry/offsets, all CAM ops listed above, 9 posts, GRBL streaming (sim-tested),
 image pipelines, STL/OBJ/SVG/DXF IO, marching tets, tet meshing + VTK/Gmsh export, SDF CAD with
 constrained sketches/parameters/holes/threads/sweep/loft, pipeline planner + conflicts + merge,
-Z-map simulation + material rendering, GPU classification, AI agent loop (offline-tested), CLI,
+Z-map simulation + material rendering, GPU classification + adapter choice/CPU-rendering fallback, AI agent loop (offline-tested), CLI,
 docs registry/scaffold/check + headless screenshots. GUI: pipeline stepper + 3 module windows
 (screenshot-verified under xvfb). Not yet verified on real hardware.
 
@@ -121,5 +121,17 @@ docs registry/scaffold/check + headless screenshots. GUI: pipeline stepper + 3 m
 - Pipeline footprints: Pocket/V-carve use the filled region, every other 2D strategy a ±1.6 mm band
   along the vectors (otherwise an engraved border "overlaps" everything inside it).
 - Docs screenshots must be deterministic (no timings/clock in visible text when `app.docs` is set).
+- **egui puts a whole window's triangles in ONE vertex buffer per frame** (20 B/vertex, 60 B/triangle,
+  default wgpu limit 256 MiB). A fine simulation mesh overflowed it and wgpu panicked. Everything the
+  viewport draws goes through `viewport::Draw` / `gpu_guard::take_{triangles,segments}` (per-window,
+  per-pass vertex budget = `RenderBudget::frame_vertices`); big meshes are pre-decimated
+  (`TriMesh::decimated`), sims coarsened (`ezyx_sim::cell_for_budget`, `StockSim::lod_for_budget`).
+  New drawing code must reserve from the budget too. Even with `on_uncaptured_error` installed,
+  egui-wgpu panics on its own after an oversized buffer ("Failed to create staging buffer") — the
+  budget must prevent it; `gpu_guard::install_panic_fallback` relaunches with `EZYX_RENDER=cpu` on the
+  autosaved `config_dir/ezyx-craft/recovery.ezyx` as a last resort.
+- GPU test hooks: `EZYX_RENDER=auto|gpu|cpu`, `EZYX_MAX_BUFFER_MB=8` (fake small GPU),
+  `EZYX_FRAME_BUDGET=<tris>` (forces overflow → panic fallback), `EZYX_SIM_CELL=0.05` (huge sim).
+  Software adapters (llvmpipe/lavapipe/WARP) are `DeviceType::Cpu`; xvfb runs exercise that path.
 - GRBL "ok" accounting: manual lines and job lines share one queue; don't send manual lines
   while a job streams (UI disables run controls appropriately).

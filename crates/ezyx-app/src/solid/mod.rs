@@ -111,6 +111,12 @@ impl Modeler {
         self.tab = SolidTab::Features;
     }
 
+    /// Drop the cached display mesh (rebuilt within the current GPU budget).
+    pub fn clear_display(&mut self) {
+        self.mesh = None;
+        self.building = None;
+    }
+
     pub fn on_result(&mut self, r: SolidResult) {
         match r {
             SolidResult::Mesh { hash, mesh } => {
@@ -253,7 +259,9 @@ fn ensure_mesh(app: &mut EzApp, ctx: &egui::Context) {
     }
     app.solid.building = Some(hash);
     let res = app.solid.resolution;
-    app.tasks.spawn(ctx, move || TaskResult::Solid(SolidResult::Mesh { hash, mesh: part.mesh(res) }));
+    // Fine previews of big parts are simplified to the GPU budget (exports use full resolution).
+    let max_tris = app.budget.mesh_triangles;
+    app.tasks.spawn(ctx, move || TaskResult::Solid(SolidResult::Mesh { hash, mesh: part.mesh(res).decimated(max_tris) }));
 }
 
 fn command_manager(app: &mut EzApp, ui: &mut Ui) {
