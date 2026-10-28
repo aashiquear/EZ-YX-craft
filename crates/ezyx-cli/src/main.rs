@@ -3,8 +3,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ezyx_core::DVec2;
-use ezyx_project::{commands::Command, ops, History, OpKind, OperationSpec, Project};
-use ezyx_tooldb::{Operation, ToolLibrary};
+use ezyx_project::{commands::Command, ops, History, Project};
+use ezyx_tooldb::ToolLibrary;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -101,6 +101,18 @@ enum Cmd {
         #[arg(long, default_value_t = 1.0)]
         size: f64,
     },
+    /// Write the feature registry (drives GUI tooltips and the user manual) as JSON.
+    DocsRegistry {
+        #[arg(short, long, default_value = "docs/manual/registry.json")]
+        out: PathBuf,
+    },
+    /// Show a project's pipeline: stock, features, planned toolpaths and conflicts.
+    Pipeline {
+        project: PathBuf,
+        /// Re-plan every feature's toolpaths with the recommended bits and save the project.
+        #[arg(long)]
+        replan: bool,
+    },
     /// Stream G-code to a machine.
     Send {
         file: PathBuf,
@@ -166,6 +178,46 @@ fn main() -> Result<()> {
             let p = demo_project(&text)?;
             p.save(&out)?;
             println!("Wrote {} ({} vectors, {} operations)", out.display(), p.vectors.len(), p.operations.len());
+        }
+        Cmd::DocsRegistry { out } => {
+            let mut json = serde_json::to_string_pretty(&ezyx_project::registry::registry())?;
+            json.push('\n');
+            if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&out, json)?;
+            println!("Wrote {}", out.display());
+        }
+        Cmd::Pipeline { project, replan } => {
+            let mut p = Project::load(&project)?;
+            let lib = ToolLibrary::bundled();
+            if replan {
+                let (n, errs) = ezyx_project::pipeline::replan(&mut p, &lib, &[]);
+                p.save(&project)?;
+                println!("Planned {n} toolpaths{}", if errs.is_empty() { String::new() } else { format!(" ({})", errs.join("; ")) });
+            }
+            let j = &p.job;
+            println!("① Stock: {} {:.1} × {:.1} × {:.1} mm, {}", p.stock_shape.label(), j.width, j.height, j.thickness, j.material);
+            println!("② Features:");
+            for f in &p.features {
+                println!("  #{} {} — {} · {} · rev {}", f.id, f.name, f.kind.label(), f.source.label(), f.revision);
+                for o in p.operations.iter().filter(|o| o.feature_id == Some(f.id)) {
+                    println!("     {} {} [{}] {:.2} mm", if o.auto { "•" } else { "✋" }, o.name, o.tool_id, o.cut_depth);
+                }
+            }
+            for o in p.operations.iter().filter(|o| o.feature_id.is_none()) {
+                println!("  ✋ {} [{}]", o.name, o.tool_id);
+            }
+            let res = ops::compute_all(&p, &lib);
+            let s = ezyx_project::jobsheet::summarize(&p, &lib, &res);
+            println!("③ Toolpaths: {} · ≈ {:.1} min · {} tool change(s)", s.steps.len(), s.total_seconds / 60.0, s.tool_changes);
+            let conflicts = ezyx_project::pipeline::analyze(&p, &lib);
+            if conflicts.is_empty() {
+                println!("✔ no conflicts");
+            }
+            for c in conflicts {
+                println!("{:?}: {}", c.severity, c.message);
+            }
         }
         Cmd::Gcode { project, out, post } => {
             let mut p = Project::load(&project)?;
@@ -346,70 +398,7 @@ fn confirm_stdin(name: &str, input: &serde_json::Value) -> bool {
 }
 
 fn demo_project(text: &str) -> Result<Project> {
-    let mut p = Project::default();
-    let mut h = History::default();
-    let run = |p: &mut Project, h: &mut History, c: Command| h.execute(p, &c).map_err(|e| anyhow!(e));
-    run(
-        &mut p,
-        &mut h,
-        Command::SetJob { width: Some(300.0), height: Some(140.0), thickness: Some(18.0), material: Some("hardwood.walnut".into()), safe_z: None },
-    )?;
-    run(&mut p, &mut h, Command::AddRectangle { x: 10.0, y: 10.0, w: 280.0, h: 120.0, corner_radius: 12.0 })?;
-    run(&mut p, &mut h, Command::AddRectangle { x: 20.0, y: 20.0, w: 260.0, h: 100.0, corner_radius: 8.0 })?;
-    let border_ids: Vec<u64> = p.vectors.iter().map(|v| v.id).collect();
-    let text_ids = if ezyx_project::text::find_system_font().is_some() {
-        run(&mut p, &mut h, Command::AddText { text: text.into(), height: 50.0, x: 0.0, y: 0.0, font_path: None })?;
-        let ids: Vec<u64> = p.vectors.iter().filter(|v| !border_ids.contains(&v.id)).map(|v| v.id).collect();
-        run(&mut p, &mut h, Command::CenterOnStock { ids: ids.clone() })?;
-        ids
-    } else {
-        run(&mut p, &mut h, Command::AddStar { cx: 150.0, cy: 70.0, r_outer: 40.0, r_inner: 18.0, points: 5 })?;
-        vec![p.vectors.last().unwrap().id]
-    };
-    let add = |p: &mut Project, h: &mut History, name: &str, kind: OpKind, tool: &str, depth: f64, ids: Vec<u64>, pass: Operation| {
-        h.execute(
-            p,
-            &Command::AddOperation {
-                spec: OperationSpec {
-                    id: 0,
-                    name: name.into(),
-                    enabled: true,
-                    kind,
-                    tool_id: tool.into(),
-                    pass,
-                    start_depth: 0.0,
-                    cut_depth: depth,
-                    vector_ids: ids,
-                    direction: Default::default(),
-                    cutting_override: None,
-                },
-            },
-        )
-        .map_err(|e| anyhow!(e))
-    };
-    add(
-        &mut p,
-        &mut h,
-        "V-carve text",
-        OpKind::VCarve { flat_depth: None, step: 0.25, clearance_tool_id: None },
-        "generic.v60",
-        10.0,
-        text_ids,
-        Operation::Finishing,
-    )?;
-    add(&mut p, &mut h, "Border groove", OpKind::Engrave, "generic.v90", 2.0, vec![border_ids[1]], Operation::Finishing)?;
-    add(
-        &mut p,
-        &mut h,
-        "Cut out",
-        OpKind::Profile(ezyx_cam::ops::profile::ProfileOptions { tabs: Some(Default::default()), ..Default::default() }),
-        "generic.flat_1_4_2f",
-        18.0,
-        vec![border_ids[0]],
-        Operation::Roughing,
-    )?;
-    p.name = format!("{text} sign");
-    Ok(p)
+    ezyx_project::demo::sign(text).map_err(|e| anyhow!(e))
 }
 
 /// Orthographic top-down render with material albedo and a low sun for relief shading.

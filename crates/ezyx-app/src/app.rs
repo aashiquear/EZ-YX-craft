@@ -1,12 +1,18 @@
-//! Application state, layout and action dispatch.
+//! Application shell.
+//!
+//! The main window is the **pipeline** (① Stock → ② Design → ③ Toolpaths → ④ Output). The
+//! **Image Studio**, **Solid Modeler** and **Machine Control** are separate modules that open in
+//! their own native windows (so they can sit side by side with the pipeline) or, if the user
+//! prefers / the platform can't do multiple windows, as full-window tabs inside the main window.
+//! Modules never mutate the pipeline behind its back: they send results through
+//! `ezyx_project::Command`s (`ImportFeature` / `ReimportFeature`), which gives undo and merge
+//! reports for free.
 
-use crate::panels;
-use crate::ribbon::{self, Action, DrawTool, OpTemplate, Prim, Tab};
+use crate::ribbon::{self, Action, Align, DrawTool, Module, OpTemplate, PassFilter, Step};
 use crate::tasks::{TaskResult, Tasks};
-use crate::theme;
-use crate::viewport::{self, Camera, Draw, Projector, ViewPreset};
-use egui::{Color32, Pos2, RichText, Sense, Stroke};
-use ezyx_cad::{BooleanOp, Feature, Part, Shape};
+use crate::viewport::{Camera, ViewPreset};
+use crate::{docshots, gpu_guard, image_studio, machine_control, panels, pipeline, solid, theme};
+use egui::RichText;
 use ezyx_cam::ops::{
     pocket::PocketOptions,
     profile::{ProfileOptions, ProfileSide},
@@ -17,10 +23,12 @@ use ezyx_mesh::TriMesh;
 use ezyx_project::{
     commands::Command,
     ops::{OpResult, ReliefSource},
-    History, OpKind, OperationSpec, PartObject, Project, ReliefObject,
+    pipeline::{Conflict, FeatureSource, StockShape},
+    History, OpKind, OperationSpec, Project,
 };
 use ezyx_tooldb::{Operation, ToolLibrary};
 use glam::Vec3;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -28,17 +36,85 @@ use std::path::PathBuf;
 pub struct DrawState {
     pub start: Option<Vec3>,
     pub pts: Vec<Vec3>,
-    pub box_start: Option<Pos2>,
+    pub box_start: Option<egui::Pos2>,
+    /// Quick-key entry while drawing ("120,60" + Enter).
+    pub typed: String,
+    /// Measure tool: first point and last measured segment.
+    pub measure: Option<(Vec3, Option<Vec3>)>,
 }
 
 pub struct Dialogs {
     pub about: bool,
+    pub settings: bool,
     pub text_at: Option<Vec3>,
     pub text: String,
     pub text_height: f64,
     pub font_path: String,
     pub offset: f64,
-    pub tet_report: Option<String>,
+    pub merge_report: Option<(String, bool)>,
+    /// A graphics setting changed this session (applies after a restart).
+    pub graphics_changed: bool,
+}
+
+/// Preferences persisted in the user's config dir.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Prefs {
+    /// Open modules as separate OS windows (else as tabs in the main window).
+    pub separate_windows: bool,
+    pub dark: bool,
+    pub snap_grid: bool,
+    pub grid: f64,
+    pub snap_objects: bool,
+    /// Viewport rendering: best GPU, forced GPU, or CPU (software) rasteriser.
+    pub render_mode: ezyx_gpu::RenderMode,
+    /// Graphics API (Vulkan / Metal / DX12 / OpenGL), `Auto` = best available.
+    pub gpu_backend: ezyx_gpu::GpuBackend,
+    /// Always start with halved preview budgets (after a GPU crash on a tablet, or by choice).
+    pub reduced_graphics: bool,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            separate_windows: !crate::platform::MOBILE,
+            dark: false,
+            snap_grid: true,
+            grid: 0.5,
+            snap_objects: true,
+            render_mode: ezyx_gpu::RenderMode::Auto,
+            gpu_backend: ezyx_gpu::GpuBackend::Auto,
+            reduced_graphics: false,
+        }
+    }
+}
+
+/// Something about the graphics setup the user should know (start-up fallback, runtime error).
+#[derive(Debug, Clone)]
+pub struct GpuNotice {
+    pub title: String,
+    pub lines: Vec<String>,
+    /// Offer "restart with CPU rendering" (we're not already on the CPU renderer).
+    pub offer_cpu: bool,
+    pub remember: bool,
+}
+
+impl Prefs {
+    fn path() -> Option<PathBuf> {
+        crate::platform::config_dir().map(|d| d.join("ezyx-craft").join("prefs.json"))
+    }
+    pub fn load() -> Self {
+        let mut p: Self = Self::path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        // Tablets have one window: modules are always tabs.
+        p.separate_windows &= !crate::platform::MOBILE;
+        p
+    }
+    pub fn save(&self) {
+        if let Some(p) = Self::path() {
+            let _ = std::fs::create_dir_all(p.parent().unwrap_or(&p));
+            let _ = std::fs::write(p, serde_json::to_string_pretty(self).unwrap_or_default());
+        }
+    }
 }
 
 pub struct EzApp {
@@ -46,93 +122,225 @@ pub struct EzApp {
     pub history: History,
     pub library: ToolLibrary,
     pub path: Option<PathBuf>,
-    pub tab: Tab,
+    pub step: Step,
     pub tool: DrawTool,
     pub selection: Vec<u64>,
+    pub selected_feature: Option<u64>,
     pub selected_op: Option<u64>,
-    pub selected_part: Option<u64>,
-    pub selected_mesh: Option<u64>,
     pub cam: Camera,
     pub mode2d: bool,
-    pub dark: bool,
+    pub prefs: Prefs,
     pub show_ai: bool,
     pub status: String,
     pub rev: u64,
     pub results: Vec<OpResult>,
     pub results_rev: u64,
+    pub conflicts: Vec<Conflict>,
+    conflicts_rev: u64,
+    pub passes: PassFilter,
     pub preview: Option<TriMesh>,
     pub preview_info: String,
     pub display: HashMap<String, (u64, TriMesh)>,
-    pub part_building: HashSet<u64>,
     pub tasks: Tasks,
     pub gpu: Option<ezyx_gpu::GpuInfo>,
     pub perf: ezyx_gpu::PerfDefaults,
+    /// Buffer/triangle/memory budgets for the device actually in use (shrinks after GPU errors).
+    pub budget: ezyx_gpu::RenderBudget,
+    /// The adapter in use and why it was chosen.
+    pub graphics: gpu_guard::StartupReport,
+    pub gpu_notice: Option<GpuNotice>,
+    /// A mesh had to be thinned to fit this frame's GPU budget.
+    pub simplified: bool,
+    /// Project revision and time of the last recovery autosave.
+    autosaved: (u64, std::time::Instant),
+    /// Pending open/save requests (OS dialog on desktop, in-app browser on mobile).
+    pub files: crate::files::Files,
     pub draw: DrawState,
     pub dialogs: Dialogs,
-    pub image: panels::image::ImageState,
+    pub image: image_studio::Studio,
+    pub solid: solid::Modeler,
     pub machine: panels::machine::MachineState,
     pub ai: panels::ai::AiState,
+    /// Module windows currently open.
+    pub open: HashSet<Module>,
+    /// Embedded mode: the module shown in the main window instead of the pipeline.
+    pub focus: Option<Module>,
     pub show_toolpaths: bool,
     pub show_rapids: bool,
     pub tool_filter: String,
     pub cursor_world: Option<Vec3>,
-    /// Set by `EZYX_START_PREVIEW=1` (screenshots / smoke tests).
-    pub pending_preview: bool,
+    pub docs: Option<docshots::DocShots>,
+    pending_preview: bool,
+    /// Frames until the module windows opened by `EZYX_OPEN_MODULES` are tiled (0 = done).
+    tile_in: u32,
 }
+
+pub const STOCK_PRESETS: [(&str, f64, f64, f64, &str, StockShape); 6] = [
+    ("Walnut sign board 300 × 140 × 18", 300.0, 140.0, 18.0, "hardwood.walnut", StockShape::Rectangle),
+    ("Pine 1×6 board 600 × 140 × 19", 600.0, 140.0, 19.0, "softwood.pine", StockShape::Rectangle),
+    ("MDF sheet 600 × 400 × 12", 600.0, 400.0, 12.0, "engineered.mdf", StockShape::Rectangle),
+    ("Round maple blank Ø200 × 20", 200.0, 200.0, 20.0, "hardwood.maple", StockShape::Round),
+    ("Aluminium plate 150 × 100 × 6", 150.0, 100.0, 6.0, "metal.al6061", StockShape::Rectangle),
+    ("HDU sign foam 400 × 300 × 25", 400.0, 300.0, 25.0, "foam.hdu", StockShape::Rectangle),
+];
 
 impl EzApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        theme::apply(&cc.egui_ctx, false);
+        let prefs = Prefs::load();
+        theme::apply(&cc.egui_ctx, prefs.dark);
         let gpu = ezyx_gpu::best();
-        let perf = ezyx_gpu::defaults_for(gpu.as_ref().map(|g| g.tier).unwrap_or(ezyx_gpu::Tier::Capable));
+        // Budgets come from the device eframe actually created (see `gpu_guard::wgpu_options`).
+        let mut graphics = gpu_guard::startup().unwrap_or_default();
+        let mut mobile_gpu = crate::platform::MOBILE;
+        let (max_buffer, software, tier) = match &cc.wgpu_render_state {
+            Some(rs) => {
+                gpu_guard::install(&rs.device);
+                let info = rs.adapter.get_info();
+                let software = graphics.software || info.device_type == eframe::wgpu::DeviceType::Cpu;
+                let vendor = if software { ezyx_gpu::Vendor::Software } else { ezyx_gpu::Vendor::detect(info.vendor, &info.name) };
+                mobile_gpu |= vendor.is_mobile();
+                let (_, mut tier, _) = ezyx_gpu::classify(vendor, &info.name);
+                if info.backend == eframe::wgpu::Backend::Gl {
+                    tier = tier.min(ezyx_gpu::Tier::Legacy);
+                }
+                if graphics.adapter.is_empty() {
+                    graphics.adapter = info.name.clone();
+                    graphics.backend = format!("{:?}", info.backend);
+                    graphics.software = software;
+                }
+                (rs.device.limits().max_buffer_size, software, tier)
+            }
+            None => (256 << 20, true, ezyx_gpu::Tier::None),
+        };
+        let mut budget = ezyx_gpu::render_budget(max_buffer, software, tier);
+        if mobile_gpu {
+            budget = budget.mobile();
+        }
+        // A graphics crash on the last run (tablets can't relaunch themselves, see gpu_guard).
+        let crashed = gpu_guard::previous_crash();
+        if prefs.reduced_graphics || crashed.is_some() {
+            budget = budget.reduced();
+        }
+        let mut perf = ezyx_gpu::defaults_for(if software { ezyx_gpu::Tier::None } else { tier });
+        // Testing / power-user overrides.
+        if let Some(n) = std::env::var("EZYX_FRAME_BUDGET").ok().and_then(|v| v.parse::<usize>().ok()) {
+            budget.frame_triangles = n;
+            budget.frame_vertices = n * 6;
+            budget.preview_triangles = n * 6 / 10;
+            budget.mesh_triangles = n * 4 / 10;
+        }
+        if let Some(c) = std::env::var("EZYX_SIM_CELL").ok().and_then(|v| v.parse::<f64>().ok()) {
+            perf.sim_cell_mm = c;
+        }
+        gpu_guard::set_frame_budget(budget.frame_vertices);
+        let mut notice_lines = graphics.warnings.clone();
+        if let Ok(e) = std::env::var("EZYX_GPU_FAILED") {
+            notice_lines.retain(|l| !l.starts_with("CPU rendering is selected"));
+            notice_lines.insert(0, format!("The GPU renderer failed ({e}), so EZ-YX-craft restarted with CPU rendering and reopened your work."));
+        }
+        if let Some((e, _)) = &crashed {
+            notice_lines.insert(
+                0,
+                format!(
+                    "The graphics driver crashed last time ({e}). EZ-YX-craft started with simplified previews{} and reopened your work.",
+                    if cfg!(target_os = "android") && graphics.backend == "Gl" { " on OpenGL ES" } else { "" }
+                ),
+            );
+        }
+        let gpu_notice = (!notice_lines.is_empty()).then(|| GpuNotice {
+            title: "Graphics".into(),
+            lines: notice_lines,
+            offer_cpu: (!software && graphics.mode != ezyx_gpu::RenderMode::Gpu) || (crate::platform::MOBILE && !prefs.reduced_graphics),
+            remember: false,
+        });
+        let docs = docshots::DocShots::from_env();
         let mut app = Self {
             project: Project::default(),
             history: History::default(),
             library: ToolLibrary::bundled(),
             path: None,
-            tab: Tab::Home,
+            step: Step::Stock,
             tool: DrawTool::Select,
             selection: vec![],
+            selected_feature: None,
             selected_op: None,
-            selected_part: None,
-            selected_mesh: None,
             cam: Camera::default(),
             mode2d: true,
-            dark: false,
+            prefs,
             show_ai: false,
-            status: "Welcome! Set up your stock on the right, then draw or import a design.".into(),
+            status: "Welcome! ① Choose your stock, ② design or import features, ③ check the toolpaths, ④ get G-code.".into(),
             rev: 1,
             results: vec![],
             results_rev: 0,
+            conflicts: vec![],
+            conflicts_rev: 0,
+            passes: PassFilter::Both,
             preview: None,
             preview_info: String::new(),
             display: HashMap::new(),
-            part_building: HashSet::new(),
             tasks: Tasks::default(),
             gpu,
             perf,
+            budget,
+            graphics,
+            gpu_notice,
+            simplified: false,
+            autosaved: (0, std::time::Instant::now()),
+            files: Default::default(),
             draw: DrawState::default(),
-            dialogs: Dialogs { about: false, text_at: None, text: "Hello".into(), text_height: 30.0, font_path: String::new(), offset: 3.0, tet_report: None },
+            dialogs: Dialogs {
+                about: false,
+                settings: false,
+                text_at: None,
+                text: "Hello".into(),
+                text_height: 30.0,
+                font_path: String::new(),
+                offset: 3.0,
+                merge_report: None,
+                graphics_changed: false,
+            },
             image: Default::default(),
+            solid: Default::default(),
             machine: Default::default(),
             ai: panels::ai::AiState::load(),
+            open: HashSet::new(),
+            focus: None,
             show_toolpaths: true,
             show_rapids: true,
             tool_filter: String::new(),
             cursor_world: None,
+            docs,
             pending_preview: std::env::var("EZYX_START_PREVIEW").is_ok(),
+            tile_in: 0,
         };
+        if app.docs.is_some() {
+            // Screenshots are taken of the main window: show modules embedded, fixed look.
+            app.prefs = Prefs { separate_windows: false, ..Prefs::default() };
+            theme::apply(&cc.egui_ctx, false);
+            app.perf.sim_cell_mm = 0.25;
+            app.perf.viewport_lod = 1;
+            app.gpu_notice = None;
+        }
         // Open a project passed on the command line (also used by OS file associations).
-        if let Some(path) = std::env::args().nth(1).map(PathBuf::from) {
-            match Project::load(&path) {
-                Ok(p) => {
-                    app.project = p;
-                    app.path = Some(path);
-                    app.calculate(None);
-                }
-                Err(e) => app.status = format!("⚠ could not open {}: {e}", path.display()),
+        if let Some(path) = std::env::args().nth(1).filter(|a| !a.starts_with('-')).map(PathBuf::from) {
+            app.load_project(&path);
+        } else if let Some((_, Some(recovery))) = crashed {
+            app.load_project(&recovery);
+        }
+        // `EZYX_OPEN_MODULES=image,solid,machine` opens module windows at start (testing / kiosks).
+        for m in std::env::var("EZYX_OPEN_MODULES").unwrap_or_default().split(',') {
+            match m.trim() {
+                "image" => app.open_module(Module::Image),
+                "solid" => app.open_module(Module::Solid),
+                "machine" => app.open_module(Module::Machine),
+                _ => {}
             }
         }
+        if !app.open.is_empty() {
+            app.tile_in = 20;
+        }
+        // Try the tablets' in-app file browser on the desktop.
+        app.files.force_in_app |= std::env::var_os("EZYX_INAPP_FILES").is_some();
         app.fit_view();
         app
     }
@@ -140,9 +348,14 @@ impl EzApp {
     // ------------------------------------------------------------------ helpers
 
     pub fn exec(&mut self, c: Command) -> bool {
+        let reimport = matches!(c, Command::ReimportFeature { .. });
         match self.history.execute(&mut self.project, &c) {
             Ok(m) => {
-                self.status = m;
+                if reimport {
+                    let clean = !m.contains('✖') && !m.contains('⚠');
+                    self.dialogs.merge_report = Some((m.clone(), clean));
+                }
+                self.status = m.lines().next().unwrap_or_default().to_string();
                 self.rev += 1;
                 true
             }
@@ -155,6 +368,37 @@ impl EzApp {
 
     pub fn touch(&mut self) {
         self.rev += 1;
+    }
+
+    pub fn load_project(&mut self, path: &std::path::Path) {
+        match Project::load(path) {
+            Ok(p) => {
+                self.project = p;
+                self.history = History::default();
+                // A recovery copy is not the user's file: make them "Save As".
+                let recovered = path.file_name().map(|f| f == "recovery.ezyx").unwrap_or(false);
+                self.path = (!recovered).then(|| path.to_path_buf());
+                if !recovered {
+                    // Until the first autosave, a GPU restart reopens the file itself.
+                    gpu_guard::set_recovery_path(path.to_path_buf());
+                }
+                self.selection.clear();
+                self.selected_feature = None;
+                self.selected_op = None;
+                self.results.clear();
+                self.preview = None;
+                self.step = if self.project.features.is_empty() && self.project.operations.is_empty() { Step::Stock } else { Step::Design };
+                self.touch();
+                self.fit_view();
+                self.calculate(None);
+                self.status = if recovered {
+                    "Recovered your project after restarting the renderer — use File › Save as… to keep it.".into()
+                } else {
+                    format!("Opened {}", path.display())
+                };
+            }
+            Err(e) => self.status = format!("⚠ could not open {}: {e}", path.display()),
+        }
     }
 
     pub fn fit_view(&mut self) {
@@ -171,34 +415,25 @@ impl EzApp {
 
     pub fn set_mode2d(&mut self, on: bool) {
         self.mode2d = on;
-        if on {
-            self.cam.ortho = true;
-            self.cam.preset(ViewPreset::Top);
-        } else {
-            self.cam.ortho = false;
-            self.cam.preset(ViewPreset::Iso);
-        }
+        self.cam.ortho = on;
+        self.cam.preset(if on { ViewPreset::Top } else { ViewPreset::Iso });
         self.fit_view();
     }
 
-    fn file_dialog() -> rfd::FileDialog {
-        rfd::FileDialog::new()
+    pub fn save(&mut self, as_new: bool) {
+        match self.path.clone() {
+            Some(p) if !as_new => self.save_to(p),
+            _ => self.files.save("EZ-YX-craft project", &["ezyx"], format!("{}.ezyx", self.project.name), |app, p| app.save_to(p)),
+        }
     }
 
-    pub fn save(&mut self, as_new: bool) {
-        let path = if as_new || self.path.is_none() {
-            Self::file_dialog().add_filter("EZ-YX-craft project", &["ezyx"]).set_file_name(format!("{}.ezyx", self.project.name)).save_file()
-        } else {
-            self.path.clone()
-        };
-        if let Some(p) = path {
-            match self.project.save(&p) {
-                Ok(()) => {
-                    self.status = format!("Saved {}", p.display());
-                    self.path = Some(p);
-                }
-                Err(e) => self.status = format!("⚠ save failed: {e}"),
+    fn save_to(&mut self, p: PathBuf) {
+        match self.project.save(&p) {
+            Ok(()) => {
+                self.status = format!("Saved {}", p.display());
+                self.path = Some(p);
             }
+            Err(e) => self.status = format!("⚠ save failed: {e}"),
         }
     }
 
@@ -222,13 +457,12 @@ impl EzApp {
         }
     }
 
+    /// Hand-made operation (Toolpaths → Advanced). Never touched by the planner.
     pub fn add_op(&mut self, t: OpTemplate) {
-        let src = if let Some(id) = self.selected_part {
-            ReliefSource::Part(id)
-        } else if let Some(id) = self.selected_mesh {
-            ReliefSource::Mesh(id)
-        } else {
-            ReliefSource::AllReliefs
+        let src = match self.selected_feature.and_then(|id| self.project.features.iter().find(|f| f.id == id)).map(|f| &f.kind) {
+            Some(ezyx_project::FeatureKind::Relief { relief_id }) => ReliefSource::Relief(*relief_id),
+            Some(ezyx_project::FeatureKind::Model3D { mesh_id }) => ReliefSource::Mesh(*mesh_id),
+            _ => ReliefSource::AllReliefs,
         };
         let th = self.project.job.thickness;
         let (kind, depth, pass, name) = match t {
@@ -281,10 +515,13 @@ impl EzApp {
             vector_ids: ids,
             direction: Default::default(),
             cutting_override: None,
+            feature_id: self.selected_feature,
+            auto: false,
+            feature_rev: self.selected_feature.and_then(|id| self.project.features.iter().find(|f| f.id == id)).map(|f| f.revision).unwrap_or(0),
         };
         if self.exec(Command::AddOperation { spec }) {
             self.selected_op = self.project.operations.last().map(|o| o.id);
-            self.tab = Tab::Toolpaths;
+            self.step = Step::Toolpaths;
             self.calculate(None);
         }
     }
@@ -302,37 +539,19 @@ impl EzApp {
         }
     }
 
-    pub fn export_gcode(&mut self) {
-        match ezyx_project::ops::export_gcode(&self.project, &self.library) {
-            Ok((g, warnings)) => {
-                let ext = ezyx_gcode::post::find_post(&self.project.post_id).map(|p| p.extension).unwrap_or_else(|| "nc".into());
-                if let Some(path) = Self::file_dialog()
-                    .add_filter("G-code", &[ext.as_str(), "nc", "gcode", "tap", "ngc"])
-                    .set_file_name(format!("{}.{ext}", self.project.name))
-                    .save_file()
-                {
-                    match std::fs::write(&path, g) {
-                        Ok(()) => {
-                            self.status = format!(
-                                "G-code saved to {}{}",
-                                path.display(),
-                                if warnings.is_empty() { String::new() } else { format!(" — ⚠ {}", warnings.join("; ")) }
-                            )
-                        }
-                        Err(e) => self.status = format!("⚠ {e}"),
-                    }
-                }
-            }
-            Err(e) => self.status = format!("⚠ {e}"),
-        }
-    }
-
-    pub fn start_preview(&mut self, ctx: &egui::Context) {
+    /// Simulate material removal for the passes the filter shows (`final_render` = everything,
+    /// switch to the 3D view).
+    pub fn simulate(&mut self, ctx: &egui::Context, final_render: bool) {
         let p = self.project.clone();
         let lib = self.library.clone();
-        let cell = self.perf.sim_cell_mm.max(0.08);
+        let wanted = self.perf.sim_cell_mm.max(0.08);
+        // Memory guard: coarsen the Z-map rather than allocate gigabytes on big stock.
+        let cell = ezyx_sim::cell_for_budget(&self.project.job, wanted, self.budget.sim_max_cells);
+        let coarsened = (cell > wanted + 1e-9).then(|| format!("Simulation coarsened from {wanted:.2} to {cell:.2} mm to stay within memory"));
         let lod = self.perf.viewport_lod;
-        self.status = format!("Simulating at {cell:.2} mm resolution…");
+        let max_tris = self.budget.preview_triangles;
+        let filter = if final_render { PassFilter::Both } else { self.passes };
+        self.status = format!("Simulating {} at {cell:.2} mm resolution…", if final_render { "the finished piece" } else { "the shown passes" });
         self.tasks.spawn(ctx, move || {
             let t0 = std::time::Instant::now();
             let results = ezyx_project::ops::compute_all(&p, &lib);
@@ -341,19 +560,26 @@ impl EzApp {
                 _ => None,
             };
             let mut sim = ezyx_sim::StockSim::new(&p.job, cell);
+            if p.stock_shape == StockShape::Round {
+                ezyx_project::pipeline::mask_round_stock(&mut sim, &p.job);
+            }
             for r in &results {
-                for tp in &r.toolpaths {
+                let Some(op) = p.operations.iter().find(|o| o.id == r.op_id) else { continue };
+                for tp in r.toolpaths.iter().filter(|tp| filter.shows(ezyx_project::pipeline::toolpath_pass(op, tp))) {
                     let flat = if let Some(d) = rotary { unwrap_rotary(tp, d) } else { tp.clone() };
                     sim.apply(&flat);
                 }
             }
             let mat = ezyx_materials::find(&p.job.material).unwrap_or_else(|| ezyx_materials::library()[0].clone());
-            let lod = lod.max((sim.hm.width.max(sim.hm.height) / 900).max(1));
+            // Display mesh sized to the GPU budget (the full-resolution Z-map is still what was cut).
+            let lod = sim.lod_for_budget(max_tris, lod);
             let mut mesh = sim.render_mesh(&mat, lod);
+            let mut warnings = sim.warnings.clone();
+            warnings.extend(coarsened);
             if let Some(d) = rotary {
                 ezyx_sim::wrap_mesh_cylinder(&mut mesh, d as f32 * 0.5);
             }
-            TaskResult::Simulation { mesh, removed_cm3: sim.removed_volume() / 1000.0, warnings: sim.warnings.clone(), seconds: t0.elapsed().as_secs_f64() }
+            TaskResult::Simulation { mesh, removed_cm3: sim.removed_volume() / 1000.0, warnings, seconds: t0.elapsed().as_secs_f64(), final_render }
         });
     }
 
@@ -368,22 +594,204 @@ impl EzApp {
                         if errs.is_empty() { format!("Toolpaths ready — estimated {:.1} min", secs / 60.0) } else { format!("⚠ {}", errs.join("; ")) };
                     self.results = res;
                 }
-                TaskResult::Simulation { mesh, removed_cm3, warnings, seconds } => {
-                    self.preview_info = format!("Removed {removed_cm3:.1} cm³ · simulated in {seconds:.1} s · {} triangles", mesh.indices.len());
+                TaskResult::Simulation { mesh, removed_cm3, warnings, seconds, final_render } => {
+                    // Docs screenshots must be deterministic: no timings.
+                    let timing = if self.docs.is_some() { String::new() } else { format!(" · simulated in {seconds:.1} s") };
+                    self.preview_info = format!("Removed {removed_cm3:.1} cm³{timing} · {} triangles", mesh.indices.len());
                     if !warnings.is_empty() {
                         self.preview_info += &format!("\n⚠ {}", warnings.join("\n⚠ "));
                     }
                     self.preview = Some(mesh);
                     self.status = "Preview ready — orbit with the left mouse button.".into();
-                    if self.mode2d {
+                    if self.mode2d || final_render {
                         self.set_mode2d(false);
                     }
                 }
-                TaskResult::PartMesh { id, mesh } => {
-                    self.part_building.remove(&id);
-                    self.display.insert(format!("part{id}"), (self.rev, mesh));
-                }
+                TaskResult::Solid(r) => self.solid.on_result(r),
+                TaskResult::Studio(r) => self.image.on_result(r),
                 TaskResult::Error(e) => self.status = format!("⚠ {e}"),
+            }
+        }
+    }
+
+    /// React to GPU errors reported by `gpu_guard` instead of crashing: shrink the budgets,
+    /// simplify what is on screen, keep a recovery copy after device loss, tell the user.
+    fn poll_gpu(&mut self) {
+        self.simplified = gpu_guard::take_exceeded();
+        // Keep a recovery copy (at most once a minute, only after changes) so a GPU restart —
+        // or a crash we couldn't prevent — loses at most a minute of work.
+        let first = self.autosaved.0 == 0 && self.rev > 1;
+        if self.docs.is_none() && self.autosaved.0 != self.rev && (first || self.autosaved.1.elapsed().as_secs() >= 60) {
+            if let Ok(p) = self.save_recovery() {
+                gpu_guard::set_recovery_path(p);
+            }
+            self.autosaved = (self.rev, std::time::Instant::now());
+        }
+        let mut lines = Vec::new();
+        for e in gpu_guard::drain() {
+            let msg = e.message();
+            self.status = format!("⚠ {msg}");
+            lines.push(msg);
+            if e.is_memory() {
+                self.budget = self.budget.reduced();
+                gpu_guard::set_frame_budget(self.budget.frame_vertices);
+                if let Some(p) = self.preview.take() {
+                    self.preview = Some(p.decimated(self.budget.preview_triangles));
+                }
+                self.display.clear();
+                self.solid.clear_display();
+                lines.push(format!("Previews were simplified to fit the GPU's memory ({} triangles per frame now).", self.budget.frame_triangles));
+            }
+            if matches!(e, gpu_guard::GpuEvent::DeviceLost(_)) {
+                lines.push(match self.save_recovery() {
+                    Ok(p) => format!("Your project was saved to {} — restart to continue.", p.display()),
+                    Err(err) => format!("Could not save a recovery copy: {err}"),
+                });
+            }
+        }
+        if lines.is_empty() {
+            return;
+        }
+        let offer_cpu = !self.graphics.software && !(crate::platform::MOBILE && self.prefs.reduced_graphics);
+        let n = self.gpu_notice.get_or_insert_with(|| GpuNotice {
+            title: "Graphics problem — EZ-YX-craft kept running".into(),
+            lines: vec![],
+            offer_cpu,
+            remember: false,
+        });
+        for l in lines {
+            if !n.lines.contains(&l) && n.lines.len() < 10 {
+                n.lines.push(l);
+            }
+        }
+    }
+
+    /// Copy of the current project in the config dir (used before restarting the renderer).
+    pub fn save_recovery(&self) -> Result<PathBuf, String> {
+        let dir = crate::platform::config_dir().ok_or("no config directory")?.join("ezyx-craft");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let p = dir.join("recovery.ezyx");
+        self.project.save(&p).map_err(|e| e.to_string())?;
+        Ok(p)
+    }
+
+    /// Tablets: no software renderer and no relaunch — remember simplified previews (and OpenGL ES
+    /// on Android) for the next start instead.
+    pub fn use_safe_graphics(&mut self) {
+        self.prefs.reduced_graphics = true;
+        if cfg!(target_os = "android") {
+            self.prefs.gpu_backend = ezyx_gpu::GpuBackend::Gl;
+        }
+        self.prefs.save();
+        if let Ok(p) = self.save_recovery() {
+            gpu_guard::set_recovery_path(p);
+        }
+        self.status = "Safe graphics will be used from the next start — close and reopen EZ-YX-craft to apply it now.".into();
+    }
+
+    /// Restart the app with another renderer, reopening the current project.
+    pub fn restart_renderer(&mut self, mode: ezyx_gpu::RenderMode, remember: bool, ctx: &egui::Context) {
+        if remember {
+            self.prefs.render_mode = mode;
+            self.prefs.save();
+        }
+        let project = match self.save_recovery() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                self.status = format!("⚠ {e}");
+                self.path.clone()
+            }
+        };
+        if let Err(e) = gpu_guard::restart(mode, project.as_deref(), ctx) {
+            self.status = format!("⚠ could not restart: {e}");
+        }
+    }
+
+    fn refresh_conflicts(&mut self) {
+        if self.conflicts_rev != self.rev {
+            self.conflicts_rev = self.rev;
+            self.conflicts = ezyx_project::pipeline::analyze(&self.project, &self.library);
+        }
+    }
+
+    // ------------------------------------------------------------------ modules
+
+    pub fn open_module(&mut self, m: Module) {
+        if self.prefs.separate_windows {
+            self.open.insert(m);
+            self.focus = None;
+        } else {
+            self.focus = Some(m);
+        }
+    }
+
+    /// Reopen the editor that produced a feature, primed with that feature's source.
+    pub fn edit_feature(&mut self, id: u64, ctx: &egui::Context) {
+        let Some(f) = self.project.features.iter().find(|f| f.id == id).cloned() else { return };
+        match &f.source {
+            FeatureSource::ImageStudio { .. } => {
+                self.image.edit_feature(&f, ctx);
+                self.open_module(Module::Image);
+            }
+            FeatureSource::SolidModeler { part_id, as_relief, .. } => {
+                self.solid.edit_feature(f.id, *part_id, *as_relief);
+                self.open_module(Module::Solid);
+            }
+            _ => {
+                self.step = Step::Design;
+                if let ezyx_project::FeatureKind::Cut2D { vector_ids, .. } = &f.kind {
+                    self.selection = vector_ids.clone();
+                }
+                self.status = format!("'{}' was made here — edit its vectors in ② Design", f.name);
+            }
+        }
+    }
+
+    /// Place the pipeline on the left half of the screen and stack the open module windows on the
+    /// right half (one module gets the whole right half).
+    fn tile_windows(&mut self, ctx: &egui::Context) {
+        let monitor = ctx.input(|i| i.viewport().monitor_size).unwrap_or(egui::vec2(1920.0, 1080.0));
+        let mods: Vec<Module> = Module::ALL.iter().copied().filter(|m| self.open.contains(m)).collect();
+        if mods.is_empty() {
+            self.status = "Open a module (Image Studio, Solid Modeler, Machine Control) to tile it next to the pipeline.".into();
+            return;
+        }
+        let half = (monitor.x * 0.5).floor();
+        let h = monitor.y - 60.0;
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(half - 8.0, h)));
+        let each = h / mods.len() as f32;
+        for (i, m) in mods.iter().enumerate() {
+            let id = module_viewport(*m);
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::OuterPosition(egui::pos2(half, each * i as f32)));
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::InnerSize(egui::vec2(half - 8.0, each - 40.0)));
+        }
+        self.fit_view();
+    }
+
+    fn module_ui(&mut self, m: Module, ui: &mut egui::Ui) {
+        match m {
+            Module::Image => image_studio::show(self, ui),
+            Module::Solid => solid::show(self, ui),
+            Module::Machine => machine_control::show(self, ui),
+        }
+    }
+
+    fn show_module_windows(&mut self, ctx: &egui::Context) {
+        for m in Module::ALL {
+            if !self.open.contains(&m) {
+                continue;
+            }
+            let builder = egui::ViewportBuilder::default().with_title(m.title()).with_inner_size([1180.0, 800.0]).with_min_inner_size([720.0, 480.0]);
+            let close = ctx.show_viewport_immediate(module_viewport(m), builder, |ui, class| {
+                if class == egui::ViewportClass::EmbeddedWindow {
+                    ui.set_min_size(egui::vec2(900.0, 600.0));
+                }
+                self.module_ui(m, ui);
+                ui.ctx().input(|i| i.viewport().close_requested())
+            });
+            if close {
+                self.open.remove(&m);
             }
         }
     }
@@ -398,46 +806,20 @@ impl EzApp {
                 self.history = History::default();
                 self.path = None;
                 self.selection.clear();
+                self.selected_feature = None;
                 self.selected_op = None;
                 self.results.clear();
                 self.preview = None;
+                self.step = Step::Stock;
                 self.touch();
                 self.fit_view();
-                self.status = "New project — set your stock size on the right.".into();
+                self.status = "New project — choose your stock.".into();
             }
-            Action::Open => {
-                if let Some(p) = Self::file_dialog().add_filter("EZ-YX-craft project", &["ezyx"]).pick_file() {
-                    match Project::load(&p) {
-                        Ok(pr) => {
-                            self.project = pr;
-                            self.history = History::default();
-                            self.path = Some(p);
-                            self.selection.clear();
-                            self.results.clear();
-                            self.preview = None;
-                            self.touch();
-                            self.fit_view();
-                            self.status = "Project opened".into();
-                        }
-                        Err(e) => self.status = format!("⚠ {e}"),
-                    }
-                }
-            }
+            Action::Open => self.files.open("EZ-YX-craft project", &["ezyx"], |app, p| app.load_project(&p)),
             Action::Save => self.save(false),
             Action::SaveAs => self.save(true),
-            Action::ImportVectors => {
-                if let Some(p) = Self::file_dialog().add_filter("Vectors", &["svg", "dxf"]).pick_file() {
-                    self.exec(Command::ImportVectors { path: p.display().to_string() });
-                }
-            }
-            Action::ImportMesh => {
-                if let Some(p) = Self::file_dialog().add_filter("3D model", &["stl", "obj"]).pick_file() {
-                    if self.exec(Command::ImportMesh { path: p.display().to_string(), fit_to_stock: true, depth: self.project.job.thickness * 0.6 }) {
-                        self.selected_mesh = self.project.meshes.last().map(|m| m.id);
-                        self.set_mode2d(false);
-                    }
-                }
-            }
+            Action::ImportVectors => self.files.open("vectors (SVG/DXF)", &["svg", "dxf"], |app, p| app.import_vectors(&p)),
+            Action::ImportMesh => self.files.open("3D model (STL/OBJ)", &["stl", "obj"], |app, p| app.import_mesh(&p)),
             Action::Undo => {
                 if self.history.undo(&mut self.project) {
                     self.touch();
@@ -450,13 +832,30 @@ impl EzApp {
                     self.status = "Redo".into();
                 }
             }
+            Action::GoTo(s) => self.go_to(s, ctx),
+            Action::NextStep => {
+                if let Some(n) = self.step.next() {
+                    self.go_to(n, ctx);
+                }
+            }
+            Action::StockPreset(i) => {
+                let (name, w, h, t, mat, shape) = STOCK_PRESETS[i.min(STOCK_PRESETS.len() - 1)];
+                self.exec(Command::SetFlat);
+                let material = ezyx_materials::find(mat).map(|m| m.id);
+                self.exec(Command::SetJob { width: Some(w), height: Some(h), thickness: Some(t), material, safe_z: None });
+                self.exec(Command::SetStockShape { shape });
+                self.fit_view();
+                self.status = format!("Stock: {name}");
+            }
             Action::Tool(t) => {
                 self.tool = t;
                 self.draw = DrawState::default();
                 if t != DrawTool::Select && !self.mode2d {
                     self.set_mode2d(true);
                 }
-                self.tab = Tab::Design2D;
+                if self.step != Step::Design {
+                    self.step = Step::Design;
+                }
             }
             Action::AddStar => {
                 self.exec(Command::AddStar { cx: center.x, cy: center.y, r_outer: 40.0, r_inner: 18.0, points: 5 });
@@ -483,186 +882,68 @@ impl EzApp {
                 let ids = self.selection.clone();
                 self.exec(Command::CenterOnStock { ids });
             }
+            Action::Align(al) => self.align(al),
+            Action::Distribute { horizontal } => self.distribute(horizontal),
+            Action::Mirror { horizontal } => {
+                let ids = self.selection.clone();
+                let m = if horizontal { [-1.0, 0.0, 0.0, 1.0, 0.0, 0.0] } else { [1.0, 0.0, 0.0, -1.0, 0.0, 0.0] };
+                self.exec(Command::TransformVectors { ids, matrix: m, about_center: true });
+            }
             Action::Delete => {
                 let ids = std::mem::take(&mut self.selection);
-                self.exec(Command::DeleteVectors { ids });
-            }
-            Action::ReliefFromImage | Action::ImageRelief => {
-                if self.image.ensure_loaded(ctx) {
-                    let mut o = self.image.relief.clone();
-                    o.origin = center - DVec2::new(o.width_mm, o.width_mm * self.image.aspect()) * 0.5;
-                    let path = self.image.path.clone().unwrap_or_default();
-                    if self.exec(Command::ImageRelief { path, options: o }) {
-                        self.set_mode2d(false);
-                    }
+                if !ids.is_empty() {
+                    self.exec(Command::DeleteVectors { ids });
                 }
             }
-            Action::DomeFromVectors => self.dome_from_selection(),
-            Action::DemoPart => {
-                if self.exec(Command::AddDemoPart) {
-                    self.selected_part = self.project.parts.last().map(|p| p.id);
-                    self.tab = Tab::Model3D;
-                    self.set_mode2d(false);
+            Action::SelectAll => {
+                let locked: Vec<usize> = self.project.layers.iter().enumerate().filter(|(_, l)| l.locked || !l.visible).map(|(i, _)| i).collect();
+                self.selection = self.project.vectors.iter().filter(|v| !locked.contains(&v.layer)).map(|v| v.id).collect();
+            }
+            Action::Carve(strategy) => {
+                let ids = self.selection.clone();
+                if self.exec(Command::CarveVectors { ids, strategy, depth: None, name: None }) {
+                    self.selected_feature = self.project.features.last().map(|f| f.id);
+                    self.selection.clear();
+                    self.calculate(Some(ctx));
                 }
             }
-            Action::NewPart => {
-                let part =
-                    Part::new("Part").add(Feature::new("Base", BooleanOp::Add, Shape::Box { size: [60.0, 40.0, 10.0], corner_radius: 2.0 }).at(0.0, 0.0, 5.0));
-                if self.exec(Command::AddPart { part }) {
-                    self.selected_part = self.project.parts.last().map(|p| p.id);
-                    self.set_mode2d(false);
+            Action::OpenModule(m) => self.open_module(m),
+            Action::EditFeature(id) => self.edit_feature(id, ctx),
+            Action::AutoPlanAll => {
+                // Back to the planner's defaults for every feature (keeps hand-made operations).
+                let ids: Vec<u64> = self.project.features.iter().map(|f| f.id).collect();
+                self.history.checkpoint(&self.project, "auto-plan all");
+                // Hand-tuned copies of planned passes go; operations added via Advanced stay.
+                let tuned: Vec<(u64, bool, bool)> = self.project.features.iter().map(|f| (f.id, f.plan.hand_rough, f.plan.hand_finish)).collect();
+                self.project.operations.retain(|o| {
+                    !tuned.iter().any(|(fid, r, fi)| {
+                        o.feature_id == Some(*fid) && !o.auto && ((*r && o.pass == Operation::Roughing) || (*fi && o.pass == Operation::Finishing))
+                    })
+                });
+                for f in self.project.features.iter_mut() {
+                    f.plan = Default::default();
                 }
+                let (n, errs) = ezyx_project::pipeline::replan(&mut self.project, &self.library, &ids);
+                self.status =
+                    if errs.is_empty() { format!("🪄 Planned {n} toolpaths with the recommended bits") } else { format!("⚠ {}", errs.join("; ")) };
+                self.touch();
+                self.calculate(Some(ctx));
             }
-            Action::Primitive(prim) => {
-                let shape = match prim {
-                    Prim::Box => Shape::Box { size: [30.0, 30.0, 15.0], corner_radius: 1.0 },
-                    Prim::Cylinder => Shape::Cylinder { radius: 10.0, height: 20.0 },
-                    Prim::Sphere => Shape::Sphere { radius: 12.0 },
-                    Prim::Cone => Shape::Cone { r_bottom: 12.0, r_top: 4.0, height: 20.0 },
-                    Prim::Torus => Shape::Torus { major: 15.0, minor: 4.0 },
-                };
-                self.add_feature(Feature::new(format!("{prim:?}"), BooleanOp::Add, shape));
-            }
-            Action::Extrude | Action::Revolve => {
-                let sketch: Vec<_> = self.project.paths_for(&self.selection).into_iter().filter(|p| p.closed).collect();
-                if sketch.is_empty() {
-                    self.status = "Select closed vectors first (2D Design tab).".into();
-                } else if a == Action::Extrude {
-                    // Centre the sketch on the part origin.
-                    let b = sketch.iter().fold(ezyx_core::Bounds2::EMPTY, |acc, l| acc.union(&l.bounds()));
-                    let t = ezyx_core::DAffine2::from_translation(-b.center());
-                    let sketch = sketch.iter().map(|l| l.transform(&t)).collect();
-                    self.add_feature(Feature::new("Extrude", BooleanOp::Add, Shape::Extrude { sketch, height: 10.0, draft_deg: 0.0 }));
-                } else {
-                    let b = sketch.iter().fold(ezyx_core::Bounds2::EMPTY, |acc, l| acc.union(&l.bounds()));
-                    let t = ezyx_core::DAffine2::from_translation(-DVec2::new(b.min.x, b.min.y));
-                    let profile = sketch.iter().map(|l| l.transform(&t)).collect();
-                    self.add_feature(Feature::new("Revolve", BooleanOp::Add, Shape::Revolve { profile, angle_deg: 360.0 }));
-                }
-            }
-            Action::PartToRelief => {
-                if self.selected_part.is_some() {
-                    self.add_op(OpTemplate::Rough3d);
-                    self.add_op(OpTemplate::Finish3d);
-                } else {
-                    self.status = "Select a part in the project tree first.".into();
-                }
-            }
-            Action::ExportPartStl => {
-                if let Some(po) = self.selected_part.and_then(|id| self.project.parts.iter().find(|p| p.id == id)) {
-                    let mesh = po.part.mesh(0.4);
-                    if let Some(path) = Self::file_dialog().add_filter("STL", &["stl"]).set_file_name("part.stl").save_file() {
-                        self.status = match ezyx_mesh::io::write_stl(&mesh, &path) {
-                            Ok(()) => format!("Exported {}", path.display()),
-                            Err(e) => format!("⚠ {e}"),
-                        };
-                    }
-                }
-            }
-            Action::PartTetMesh => {
-                if let Some(po) = self.selected_part.and_then(|id| self.project.parts.iter().find(|p| p.id == id)) {
-                    let tm = po.part.tet_mesh(1.0);
-                    self.save_tet(tm);
-                }
-            }
-            Action::MeshFit => {
-                if let Some(id) = self.selected_mesh {
-                    let depth = self.project.job.thickness * 0.6;
-                    let job = self.project.clone();
-                    if let Some(m) = self.project.meshes.iter_mut().find(|m| m.id == id) {
-                        ezyx_project::commands::place_mesh(&mut m.mesh, &job, true, depth);
-                        self.touch();
-                    }
-                }
-            }
-            Action::MeshSmooth => {
-                if let Some(m) = self.selected_mesh.and_then(|id| self.project.meshes.iter_mut().find(|m| m.id == id)) {
-                    m.mesh.smooth_taubin(3, 0.5, -0.53);
-                    self.touch();
-                }
-            }
-            Action::ExportMeshStl => {
-                if let Some(m) = self.selected_mesh.and_then(|id| self.project.meshes.iter().find(|m| m.id == id)) {
-                    if let Some(path) = Self::file_dialog().add_filter("STL", &["stl"]).set_file_name("mesh.stl").save_file() {
-                        self.status = match ezyx_mesh::io::write_stl(&m.mesh, &path) {
-                            Ok(()) => format!("Exported {}", path.display()),
-                            Err(e) => format!("⚠ {e}"),
-                        };
-                    }
-                }
-            }
-            Action::MeshToRelief => {
-                if let Some(id) = self.selected_mesh {
-                    match ezyx_project::ops::relief_heightmap(&self.project, &ReliefSource::Mesh(id), 0.3) {
-                        Ok(hm) => {
-                            let rid = self.project.alloc_id();
-                            self.history.checkpoint(&self.project, "mesh → relief");
-                            self.project.reliefs.push(ReliefObject { id: rid, name: format!("Relief of mesh #{id}"), heightmap: hm, visible: true });
-                            self.touch();
-                        }
-                        Err(e) => self.status = format!("⚠ {e}"),
-                    }
-                } else {
-                    self.status = "Select a mesh in the project tree.".into();
-                }
-            }
-            Action::MeshTet => {
-                if let Some(r) = self.project.reliefs.last() {
-                    let tm = ezyx_mesh::tet::relief_solid(&r.heightmap, -(self.project.job.thickness as f32), 6);
-                    self.save_tet(tm);
-                } else {
-                    self.status = "Create a relief first (2.5D tab or Mesh → To Relief).".into();
-                }
-            }
-            Action::LoadImage => {
-                self.tab = Tab::Image;
-                self.image.pick(ctx);
-            }
-            Action::TraceOutline | Action::TraceCenterline => {
-                if self.image.ensure_loaded(ctx) {
-                    let mut o = self.image.trace.clone();
-                    o.origin = center - DVec2::new(o.width_mm, o.width_mm * self.image.aspect()) * 0.5;
-                    let path = self.image.path.clone().unwrap_or_default();
-                    self.exec(Command::TraceImage { path, options: o, centerline: a == Action::TraceCenterline });
-                }
-            }
-            Action::PhotoVCarve => {
-                if self.image.ensure_loaded(ctx) {
-                    let mut o = self.image.photo.clone();
-                    o.origin = center - DVec2::new(o.width_mm, o.width_mm * self.image.aspect()) * 0.5;
-                    let tool = if o.bit_angle <= 45.0 {
-                        "generic.v30"
-                    } else if o.bit_angle <= 75.0 {
-                        "generic.v60"
-                    } else {
-                        "generic.v90"
-                    };
-                    o.bit_angle = match tool {
-                        "generic.v30" => 30.0,
-                        "generic.v60" => 60.0,
-                        _ => 90.0,
-                    };
-                    let path = self.image.path.clone().unwrap_or_default();
-                    if self.exec(Command::PhotoVCarve { path, options: o, tool_id: tool.into() }) {
-                        self.selected_op = self.project.operations.last().map(|o| o.id);
-                        self.calculate(Some(ctx));
-                    }
-                }
-            }
-            Action::ImageTo3d => {
-                if self.image.ensure_loaded(ctx) {
-                    let path = self.image.path.clone().unwrap_or_default();
-                    if self.exec(Command::ImageTo3d { path, width_mm: self.image.relief.width_mm, thickness: self.image.thickness_3d }) {
-                        self.selected_mesh = self.project.meshes.last().map(|m| m.id);
-                        self.set_mode2d(false);
-                    }
-                }
+            Action::Calculate => {
+                self.exec(Command::PlanToolpaths { feature_ids: vec![] });
+                self.calculate(Some(ctx));
             }
             Action::AddOp(t) => self.add_op(t),
-            Action::Calculate => self.calculate(Some(ctx)),
-            Action::ExportGcode => self.export_gcode(),
-            Action::Preview => self.start_preview(ctx),
+            Action::ShowPasses(f) => {
+                self.passes = f;
+                self.preview = None;
+            }
+            Action::Simulate => self.simulate(ctx, false),
+            Action::FinalRender => self.simulate(ctx, true),
             Action::ClearPreview => self.preview = None,
+            Action::ExportGcode => self.export_gcode(),
+            Action::JobSheet => self.export_job_sheet(),
+            Action::SendToMachine => self.send_to_machine(),
             Action::View(v) => {
                 if self.mode2d && v != ViewPreset::Top {
                     self.mode2d = false;
@@ -677,487 +958,223 @@ impl EzApp {
             Action::Fit => self.fit_view(),
             Action::ToggleAi => self.show_ai = !self.show_ai,
             Action::ToggleDark => {
-                self.dark = !self.dark;
-                theme::apply(ctx, self.dark);
+                self.prefs.dark = !self.prefs.dark;
+                theme::apply(ctx, self.prefs.dark);
+                self.prefs.save();
             }
+            Action::TileWindows => self.tile_windows(ctx),
+            Action::Settings => self.dialogs.settings = true,
             Action::About => self.dialogs.about = true,
         }
     }
 
-    fn save_tet(&mut self, tm: ezyx_mesh::TetMesh) {
-        let q = tm.quality();
-        let report = format!(
-            "{} tetrahedra · volume {:.1} mm³\nDihedral angles {:.1}° – {:.1}°\nRadius ratio min {:.2}, mean {:.2}",
-            q.count, q.volume, q.min_dihedral, q.max_dihedral, q.min_radius_ratio, q.mean_radius_ratio
-        );
-        if let Some(path) = Self::file_dialog().add_filter("VTK", &["vtk"]).set_file_name("mesh.vtk").save_file() {
-            let _ = std::fs::write(&path, tm.to_vtk());
-            let _ = std::fs::write(path.with_extension("msh"), tm.to_gmsh());
-            self.dialogs.tet_report = Some(format!("{report}\n\nSaved {} and .msh", path.display()));
-        } else {
-            self.dialogs.tet_report = Some(report);
+    fn go_to(&mut self, s: Step, ctx: &egui::Context) {
+        self.step = s;
+        match s {
+            Step::Stock => {
+                self.tool = DrawTool::Select;
+                self.preview = None;
+            }
+            Step::Design => self.preview = None,
+            Step::Toolpaths | Step::Output => {
+                self.tool = DrawTool::Select;
+                // Arriving here always shows an up-to-date plan.
+                if self.results_rev != self.rev || self.results.is_empty() {
+                    self.calculate(Some(ctx));
+                }
+            }
         }
     }
 
-    fn add_feature(&mut self, f: Feature) {
-        if self.selected_part.is_none() {
-            let part = Part::new("Part");
-            self.exec(Command::AddPart { part });
-            self.selected_part = self.project.parts.last().map(|p| p.id);
-        }
-        let id = self.selected_part.unwrap();
-        self.history.checkpoint(&self.project, "add feature");
-        if let Some(po) = self.project.parts.iter_mut().find(|p| p.id == id) {
-            po.part.features.push(f);
-        }
-        self.touch();
-        self.tab = Tab::Model3D;
-        if self.mode2d {
-            self.set_mode2d(false);
+    pub fn import_vectors(&mut self, p: &std::path::Path) {
+        let path = p.display().to_string();
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let polys = match ext.as_str() {
+            "svg" => std::fs::read(p).map_err(|e| e.to_string()).and_then(|b| ezyx_project::import::import_svg(&b)),
+            "dxf" => ezyx_project::import::import_dxf(p),
+            other => Err(format!("unsupported vector format '.{other}'")),
+        };
+        match polys {
+            Ok(paths) => {
+                let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Import".into());
+                let payload = ezyx_project::Payload::Vectors { paths, strategy: None, depth: None };
+                if self.exec(Command::ImportFeature { name, payload, source: FeatureSource::File { path } }) {
+                    self.selected_feature = self.project.features.last().map(|f| f.id);
+                    self.step = Step::Design;
+                }
+            }
+            Err(e) => self.status = format!("⚠ {e}"),
         }
     }
 
-    fn dome_from_selection(&mut self) {
-        let region = self.project.region_for(&self.selected_or_all_closed());
-        if region.is_empty() {
-            self.status = "Select closed vectors to inflate.".into();
+    pub fn import_mesh(&mut self, p: &std::path::Path) {
+        match ezyx_mesh::io::load(p) {
+            Ok(mut mesh) => {
+                // Fit big models into the stock (90 % of XY, 60 % of the thickness).
+                ezyx_project::commands::place_mesh(&mut mesh, &self.project, true, self.project.job.thickness * 0.6);
+                let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Model".into());
+                let payload = ezyx_project::Payload::Mesh { mesh };
+                if self.exec(Command::ImportFeature { name, payload, source: FeatureSource::File { path: p.display().to_string() } }) {
+                    self.selected_feature = self.project.features.last().map(|f| f.id);
+                    self.set_mode2d(false);
+                }
+            }
+            Err(e) => self.status = format!("⚠ {e}"),
+        }
+    }
+
+    fn sel_bounds(&self, ids: &[u64]) -> ezyx_core::Bounds2 {
+        ids.iter().filter_map(|id| self.project.vector(*id)).fold(ezyx_core::Bounds2::EMPTY, |a, v| a.union(&v.path.bounds()))
+    }
+
+    fn align(&mut self, al: Align) {
+        if self.selection.is_empty() {
             return;
         }
-        let b = region.bounds();
-        let cell = 0.4;
-        let pad = 2.0;
-        let w = ((b.size().x + 2.0 * pad) / cell).ceil() as usize;
-        let h = ((b.size().y + 2.0 * pad) / cell).ceil() as usize;
-        let origin = b.min - DVec2::splat(pad);
-        let mut bm = ezyx_image::Bitmap::new(w, h);
-        let mut gray = ezyx_image::GrayImage::new(w, h, 0.5);
-        for y in 0..h {
-            for x in 0..w {
-                // Image rows go top→down; world Y goes up.
-                let p = origin + DVec2::new((x as f64 + 0.5) * cell, ((h - 1 - y) as f64 + 0.5) * cell);
-                if region.contains(p) {
-                    bm.set(x, y, true);
-                    gray.data[y * w + x] = 0.5;
-                }
-            }
+        // One shape aligns to the stock; several align to their common bounds.
+        let all = if self.selection.len() == 1 { self.project.job.stock_bounds() } else { self.sel_bounds(&self.selection) };
+        self.history.checkpoint(&self.project, "align");
+        for id in self.selection.clone() {
+            let b = self.sel_bounds(&[id]);
+            let d = match al {
+                Align::Left => DVec2::new(all.min.x - b.min.x, 0.0),
+                Align::Right => DVec2::new(all.max.x - b.max.x, 0.0),
+                Align::CenterX => DVec2::new(all.center().x - b.center().x, 0.0),
+                Align::Bottom => DVec2::new(0.0, all.min.y - b.min.y),
+                Align::Top => DVec2::new(0.0, all.max.y - b.max.y),
+                Align::CenterY => DVec2::new(0.0, all.center().y - b.center().y),
+            };
+            let _ = Command::MoveVectors { ids: vec![id], dx: d.x, dy: d.y }.apply(&mut self.project);
         }
-        let thickness = (self.project.job.thickness * 0.4).min(12.0);
-        let opt =
-            ezyx_image::inflate::InflateOptions { width_mm: w as f64 * cell, thickness, roundness: 0.8, detail_depth: 0.0, symmetric: false, resolution: cell };
-        let inf = ezyx_image::inflate::inflate(&gray, &bm, &opt);
-        let mut hm = inf.front;
-        hm.origin = origin;
-        // Relief convention: top of dome at Z = 0, background at the dome height below.
-        let top = hm.min_max().1;
-        hm.map(|v| v - top);
-        let id = self.project.alloc_id();
-        self.history.checkpoint(&self.project, "dome");
-        self.project.reliefs.push(ReliefObject { id, name: "Dome".into(), heightmap: hm, visible: true });
         self.touch();
-        self.status = format!("Dome relief #{id} created ({thickness:.1} mm high)");
-        self.set_mode2d(false);
+        self.status = format!("Aligned {} shape(s)", self.selection.len());
     }
 
-    fn ensure_part_meshes(&mut self, ctx: &egui::Context) {
-        let parts: Vec<PartObject> = self.project.parts.iter().filter(|p| p.visible).cloned().collect();
-        for po in parts {
-            let key = format!("part{}", po.id);
-            let fresh = self.display.get(&key).map(|(r, _)| *r == self.rev).unwrap_or(false);
-            if !fresh && !self.part_building.contains(&po.id) {
-                self.part_building.insert(po.id);
-                let id = po.id;
-                let res = if self.perf.gpu_compute { 0.6 } else { 1.0 };
-                self.tasks.spawn(ctx, move || TaskResult::PartMesh { id, mesh: po.part.mesh(res) });
-            }
+    fn distribute(&mut self, horizontal: bool) {
+        if self.selection.len() < 3 {
+            self.status = "Select three or more shapes to distribute.".into();
+            return;
         }
+        let axis = |v: DVec2| if horizontal { v.x } else { v.y };
+        let mut items: Vec<(u64, f64)> = self.selection.iter().map(|id| (*id, axis(self.sel_bounds(&[*id]).center()))).collect();
+        items.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let (first, last) = (items[0].1, items[items.len() - 1].1);
+        let step = (last - first) / (items.len() - 1) as f64;
+        self.history.checkpoint(&self.project, "distribute");
+        for (i, (id, c)) in items.iter().enumerate() {
+            let d = first + step * i as f64 - c;
+            let (dx, dy) = if horizontal { (d, 0.0) } else { (0.0, d) };
+            let _ = Command::MoveVectors { ids: vec![*id], dx, dy }.apply(&mut self.project);
+        }
+        self.touch();
     }
 
-    fn relief_mesh(&mut self, r: &ReliefObject) -> TriMesh {
-        let key = format!("relief{}", r.id);
-        if let Some((rev, m)) = self.display.get(&key) {
-            if *rev == self.rev {
-                return m.clone();
-            }
-        }
-        let lod = (r.heightmap.width.max(r.heightmap.height) / 400).max(1);
-        let m = ezyx_mesh::hm::surface(&r.heightmap, lod);
-        self.display.insert(key, (self.rev, m.clone()));
-        m
-    }
-
-    // ------------------------------------------------------------------ viewport
-
-    fn viewport(&mut self, ui: &mut egui::Ui) {
-        let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
-        let rect = resp.rect;
-        painter.rect_filled(rect, 0.0, theme::viewport_bg(self.dark));
-        let drawing = self.tool != DrawTool::Select;
-        let lmb_reserved = self.mode2d || drawing;
-        viewport::navigate(ui, &resp, &mut self.cam, rect, lmb_reserved);
-        let pr = Projector::new(&self.cam, rect);
-        let d = Draw { painter: &painter, pr: &pr };
-        let job = self.project.job.clone();
-        let rotary = match job.kind {
-            JobKind::Rotary { diameter, length, .. } => Some((diameter as f32, length as f32)),
-            _ => None,
-        };
-
-        // Stock.
-        let (w, h, t) = (job.width as f32, job.height as f32, job.thickness as f32);
-        let stock_col = if self.dark { Color32::from_gray(150) } else { Color32::from_rgb(120, 100, 80) };
-        if let (Some((dia, len)), false) = (rotary, self.mode2d) {
-            let r = dia * 0.5;
-            let n = 48;
-            for k in 0..n {
-                let a0 = std::f32::consts::TAU * k as f32 / n as f32;
-                let a1 = std::f32::consts::TAU * (k + 1) as f32 / n as f32;
-                for x in [0.0, len] {
-                    d.line(Vec3::new(x, r * a0.sin(), r * a0.cos()), Vec3::new(x, r * a1.sin(), r * a1.cos()), Stroke::new(1.0, stock_col));
-                }
-                if k % 6 == 0 {
-                    d.line(Vec3::new(0.0, r * a0.sin(), r * a0.cos()), Vec3::new(len, r * a0.sin(), r * a0.cos()), Stroke::new(0.5, stock_col));
-                }
-            }
-            d.line(Vec3::new(-10.0, 0.0, 0.0), Vec3::new(len + 10.0, 0.0, 0.0), Stroke::new(1.0, theme::ACCENT));
-        } else {
-            if self.preview.is_none() {
-                // Stock top surface.
-                let corners = [Vec3::new(0.0, 0.0, 0.0), Vec3::new(w, 0.0, 0.0), Vec3::new(w, h, 0.0), Vec3::new(0.0, h, 0.0)];
-                let pts: Vec<Pos2> = corners.iter().filter_map(|c| pr.to_screen(*c)).collect();
-                if pts.len() == 4 {
-                    let fill = if self.dark {
-                        Color32::from_rgba_unmultiplied(90, 80, 70, 120)
-                    } else {
-                        Color32::from_rgba_unmultiplied(theme::MAPLE.r(), theme::MAPLE.g(), theme::MAPLE.b(), 235)
-                    };
-                    painter.add(egui::Shape::convex_polygon(pts, fill, Stroke::NONE));
-                }
-                // Grid.
-                let step = if self.cam.dist > 1500.0 { 50.0 } else { 10.0 };
-                let gcol = if self.dark { Color32::from_gray(70) } else { Color32::from_rgba_unmultiplied(0, 0, 0, 22) };
-                let mut x = 0.0;
-                while x <= w + 0.01 {
-                    d.line(Vec3::new(x, 0.0, 0.0), Vec3::new(x, h, 0.0), Stroke::new(if (x as i32) % 50 == 0 { 1.0 } else { 0.5 }, gcol));
-                    x += step;
-                }
-                let mut y = 0.0;
-                while y <= h + 0.01 {
-                    d.line(Vec3::new(0.0, y, 0.0), Vec3::new(w, y, 0.0), Stroke::new(if (y as i32) % 50 == 0 { 1.0 } else { 0.5 }, gcol));
-                    y += step;
-                }
-            }
-            let s = Stroke::new(1.2, stock_col);
-            for z in [0.0, -t] {
-                d.polyline(&[Vec3::new(0.0, 0.0, z), Vec3::new(w, 0.0, z), Vec3::new(w, h, z), Vec3::new(0.0, h, z)], true, s);
-            }
-            for (x, y) in [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)] {
-                d.line(Vec3::new(x, y, 0.0), Vec3::new(x, y, -t), s);
-            }
-            // Datum marker.
-            let o = job.xy_datum.fraction();
-            let dp = Vec3::new(o.x as f32 * w, o.y as f32 * h, 0.0);
-            if let Some(p) = pr.to_screen(dp) {
-                painter.circle_filled(p, 4.0, theme::ACCENT);
-            }
-        }
-
-        // Solid content.
-        if let Some(m) = &self.preview {
-            d.mesh(m, [0.8, 0.7, 0.55], 255, false);
-        } else {
-            let reliefs: Vec<ReliefObject> = self.project.reliefs.iter().filter(|r| r.visible).cloned().collect();
-            for r in &reliefs {
-                let m = self.relief_mesh(r);
-                d.mesh(&m, [0.85, 0.75, 0.6], 255, false);
-            }
-            for m in self.project.meshes.iter().filter(|m| m.visible) {
-                let sel = Some(m.id) == self.selected_mesh;
-                d.mesh(&m.mesh, if sel { [0.95, 0.7, 0.45] } else { [0.75, 0.78, 0.82] }, 255, true);
-            }
-            for po in self.project.parts.iter().filter(|p| p.visible) {
-                if let Some((_, m)) = self.display.get(&format!("part{}", po.id)) {
-                    let sel = Some(po.id) == self.selected_part;
-                    // Parts are modelled around the origin; show them centred on the stock top.
-                    let mut mm = m.clone();
-                    let (lo, hi) = mm.bounds();
-                    let c = (lo + hi) * 0.5;
-                    mm.transform(&glam::Mat4::from_translation(Vec3::new(w * 0.5 - c.x, h * 0.5 - c.y, -hi.z)));
-                    d.mesh(&mm, if sel { [0.95, 0.72, 0.45] } else { [0.72, 0.76, 0.84] }, 255, true);
-                }
-            }
-        }
-
-        // Vectors (hidden under the predicted-result preview).
-        for v in self.project.vectors.iter().filter(|_| self.preview.is_none()) {
-            let sel = self.selection.contains(&v.id);
-            let col = if sel {
-                theme::VECTOR_SEL
-            } else if self.dark {
-                Color32::from_gray(220)
-            } else {
-                theme::VECTOR
-            };
-            let pts: Vec<Vec3> = v.path.pts.iter().map(|p| Vec3::new(p.x as f32, p.y as f32, 0.02)).collect();
-            d.polyline(&pts, v.path.closed, Stroke::new(if sel { 2.2 } else { 1.3 }, col));
-        }
-
-        // Toolpaths.
-        if self.show_toolpaths && self.preview.is_none() {
-            let maxd = self.results.iter().flat_map(|r| r.toolpaths.iter()).flat_map(|t| t.points()).map(|(p, _)| -p.z).fold(0.1f64, f64::max) as f32;
-            let to3 = |p: &ezyx_cam::Pt, rot: bool| -> Vec3 {
-                if rot && !self.mode2d {
-                    let r = rotary.map(|(d, _)| d * 0.5).unwrap_or(0.0) + p.z as f32;
-                    let a = (p.a as f32).to_radians();
-                    Vec3::new(p.x as f32, r * a.sin(), r * a.cos())
-                } else if rot {
-                    let circ = rotary.map(|(d, _)| std::f32::consts::PI * d).unwrap_or(1.0);
-                    Vec3::new(p.x as f32, p.a as f32 / 360.0 * circ, p.z as f32)
-                } else {
-                    Vec3::new(p.x as f32, p.y as f32, p.z as f32)
-                }
-            };
-            let total: usize = self.results.iter().flat_map(|r| r.toolpaths.iter()).map(|t| t.moves.len()).sum();
-            let stride = (total / 250_000).max(1);
-            for r in &self.results {
-                let highlighted = self.selected_op == Some(r.op_id);
-                for tp in &r.toolpaths {
-                    let mut prev: Option<Vec3> = None;
-                    for (i, (p, rapid)) in tp.points().enumerate() {
-                        let q = to3(&p, tp.rotary);
-                        if let Some(a) = prev {
-                            if rapid {
-                                if self.show_rapids && i % stride == 0 {
-                                    d.dashed(a, q, Stroke::new(0.7, theme::RAPID));
-                                }
-                            } else if i % stride == 0 || stride == 1 {
-                                let c = theme::depth_color(-(p.z as f32) / maxd);
-                                d.line(a, q, Stroke::new(if highlighted { 1.8 } else { 1.0 }, c));
-                            }
-                        }
-                        prev = Some(q);
+    pub fn export_gcode(&mut self) {
+        match ezyx_project::ops::export_gcode(&self.project, &self.library) {
+            Ok((g, warnings)) => {
+                let ext = ezyx_gcode::post::find_post(&self.project.post_id).map(|p| p.extension).unwrap_or_else(|| "nc".into());
+                let name = format!("{}.{ext}", self.project.name);
+                self.files.save("G-code", &[ext.as_str(), "nc", "gcode", "tap", "ngc"], name, move |app, path| match std::fs::write(&path, g) {
+                    Ok(()) => {
+                        app.status = format!(
+                            "G-code saved to {}{}",
+                            path.display(),
+                            if warnings.is_empty() { String::new() } else { format!(" — ⚠ {}", warnings.join("; ")) }
+                        )
                     }
-                }
-            }
-        }
-
-        // Interaction.
-        let hover = resp.hover_pos();
-        let snap = |v: Vec3, ui: &egui::Ui| {
-            if ui.input(|i| i.modifiers.alt) {
-                v
-            } else {
-                Vec3::new((v.x * 2.0).round() / 2.0, (v.y * 2.0).round() / 2.0, 0.0)
-            }
-        };
-        self.cursor_world = hover.and_then(|s| pr.ground(s, 0.0)).map(|g| snap(g, ui));
-        match self.tool {
-            DrawTool::Select => {
-                if resp.clicked() {
-                    if let Some(s) = hover {
-                        let hit = self.pick_vector(&pr, s);
-                        let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
-                        match (hit, shift) {
-                            (Some(id), true) => {
-                                if let Some(i) = self.selection.iter().position(|x| *x == id) {
-                                    self.selection.remove(i);
-                                } else {
-                                    self.selection.push(id);
-                                }
-                            }
-                            (Some(id), false) => self.selection = vec![id],
-                            (None, false) => self.selection.clear(),
-                            _ => {}
-                        }
-                        if hit.is_some() {
-                            self.selected_op = None;
-                        }
-                    }
-                }
-                if self.mode2d {
-                    if resp.drag_started_by(egui::PointerButton::Primary) {
-                        self.draw.box_start = hover;
-                    }
-                    if let (Some(a), Some(b)) = (self.draw.box_start, hover) {
-                        if resp.dragged_by(egui::PointerButton::Primary) {
-                            painter.rect_stroke(egui::Rect::from_two_pos(a, b), 0.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Middle);
-                        }
-                        if resp.drag_stopped() {
-                            let r = egui::Rect::from_two_pos(a, b);
-                            let ids: Vec<u64> = self
-                                .project
-                                .vectors
-                                .iter()
-                                .filter(|v| {
-                                    v.path.pts.iter().all(|p| pr.to_screen(Vec3::new(p.x as f32, p.y as f32, 0.0)).map(|s| r.contains(s)).unwrap_or(false))
-                                })
-                                .map(|v| v.id)
-                                .collect();
-                            if ui.input(|i| i.modifiers.shift) {
-                                self.selection.extend(ids);
-                            } else {
-                                self.selection = ids;
-                            }
-                            self.draw.box_start = None;
-                        }
-                    }
-                }
-            }
-            DrawTool::Rect | DrawTool::Circle => {
-                if resp.drag_started_by(egui::PointerButton::Primary) {
-                    self.draw.start = self.cursor_world;
-                }
-                if let (Some(a), Some(b)) = (self.draw.start, self.cursor_world) {
-                    let stroke = Stroke::new(1.5, theme::ACCENT);
-                    if self.tool == DrawTool::Rect {
-                        d.polyline(&[a, Vec3::new(b.x, a.y, 0.0), b, Vec3::new(a.x, b.y, 0.0)], true, stroke);
-                    } else {
-                        let r = (b - a).length();
-                        let pts: Vec<Vec3> = (0..64)
-                            .map(|k| a + Vec3::new((k as f32 / 64.0 * std::f32::consts::TAU).cos(), (k as f32 / 64.0 * std::f32::consts::TAU).sin(), 0.0) * r)
-                            .collect();
-                        d.polyline(&pts, true, stroke);
-                    }
-                    if resp.drag_stopped() {
-                        let cmd = if self.tool == DrawTool::Rect {
-                            let (x0, y0) = (a.x.min(b.x) as f64, a.y.min(b.y) as f64);
-                            let (ww, hh) = ((a.x - b.x).abs() as f64, (a.y - b.y).abs() as f64);
-                            (ww > 0.2 && hh > 0.2).then_some(Command::AddRectangle { x: x0, y: y0, w: ww, h: hh, corner_radius: 0.0 })
-                        } else {
-                            let r = (b - a).length() as f64;
-                            (r > 0.2).then_some(Command::AddCircle { cx: a.x as f64, cy: a.y as f64, r })
-                        };
-                        if let Some(c) = cmd {
-                            self.exec(c);
-                            self.selection = self.project.vectors.last().map(|v| vec![v.id]).unwrap_or_default();
-                        }
-                        self.draw.start = None;
-                    }
-                }
-            }
-            DrawTool::Polyline => {
-                if let Some(p) = self.cursor_world {
-                    if resp.double_clicked() {
-                        self.finish_polyline();
-                    } else if resp.clicked() {
-                        self.draw.pts.push(p);
-                    }
-                    if !self.draw.pts.is_empty() {
-                        let mut pts = self.draw.pts.clone();
-                        pts.push(p);
-                        d.polyline(&pts, false, Stroke::new(1.5, theme::ACCENT));
-                    }
-                }
-            }
-            DrawTool::Text => {
-                if resp.clicked() {
-                    self.dialogs.text_at = self.cursor_world;
-                }
-            }
-        }
-
-        d.gizmo();
-        self.viewport_overlay(ui, rect);
-        if let Some(c) = self.cursor_world {
-            let u = job.display_units;
-            painter.text(
-                rect.right_bottom() + egui::vec2(-10.0, -8.0),
-                egui::Align2::RIGHT_BOTTOM,
-                format!("X {}  Y {}", u.fmt(c.x as f64), u.fmt(c.y as f64)),
-                egui::FontId::monospace(12.0),
-                theme::STEEL,
-            );
-        }
-        if self.project.vectors.is_empty() && self.project.reliefs.is_empty() && self.project.meshes.is_empty() && self.project.parts.is_empty() {
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "Draw with the 2D Design tab · import SVG/DXF/STL · or load an image\nAsk the 🤖 Assistant: \"make a 200×100 walnut sign that says Workshop\"",
-                egui::FontId::proportional(15.0),
-                theme::STEEL,
-            );
-        }
-    }
-
-    fn finish_polyline(&mut self) {
-        let mut pts = std::mem::take(&mut self.draw.pts);
-        pts.dedup_by(|a, b| (*a - *b).length() < 1e-3);
-        if pts.len() >= 2 {
-            let closed = pts.len() > 2 && (pts[0] - *pts.last().unwrap()).length() < 2.0;
-            if closed {
-                pts.pop();
-            }
-            let points = pts.iter().map(|p| [p.x as f64, p.y as f64]).collect();
-            self.exec(Command::AddPolyline { points, closed });
-        }
-    }
-
-    fn pick_vector(&self, pr: &Projector, s: Pos2) -> Option<u64> {
-        let mut best: Option<(f32, u64)> = None;
-        for v in &self.project.vectors {
-            let pts: Vec<Pos2> = v.path.pts.iter().filter_map(|p| pr.to_screen(Vec3::new(p.x as f32, p.y as f32, 0.0))).collect();
-            let n = pts.len();
-            if n < 2 {
-                continue;
-            }
-            let segs = if v.path.closed { n } else { n - 1 };
-            for i in 0..segs {
-                let (a, b) = (pts[i], pts[(i + 1) % n]);
-                let ab = b - a;
-                let t = ((s - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
-                let dist = (a + ab * t - s).length();
-                if dist < 8.0 && best.map(|(bd, _)| dist < bd).unwrap_or(true) {
-                    best = Some((dist, v.id));
-                }
-            }
-            // Clicking inside a closed shape also selects it (beginner friendly).
-            if v.path.closed {
-                if let Some(g) = pr.ground(s, 0.0) {
-                    if v.path.contains(DVec2::new(g.x as f64, g.y as f64)) && best.is_none() {
-                        best = Some((7.9, v.id));
-                    }
-                }
-            }
-        }
-        best.map(|(_, id)| id)
-    }
-
-    fn viewport_overlay(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        egui::Area::new(egui::Id::unique("vp_overlay")).fixed_pos(rect.right_top() + egui::vec2(-400.0, 8.0)).order(egui::Order::Foreground).show(
-            ui.ctx(),
-            |ui| {
-                egui::Frame::NONE.fill(ui.visuals().window_fill.gamma_multiply(0.92)).corner_radius(8).inner_margin(6).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let label = if self.mode2d { "2D" } else { "3D" };
-                        if ui
-                            .add(egui::Button::new(RichText::new(label).strong()).fill(theme::ACCENT_SOFT))
-                            .on_hover_text("Toggle 2D drafting / 3D orbit")
-                            .clicked()
-                        {
-                            let m = !self.mode2d;
-                            self.set_mode2d(m);
-                        }
-                        for (txt, v) in [("Top", ViewPreset::Top), ("Front", ViewPreset::Front), ("Right", ViewPreset::Right), ("Iso", ViewPreset::Iso)] {
-                            if ui.small_button(txt).clicked() {
-                                if self.mode2d && v != ViewPreset::Top {
-                                    self.mode2d = false;
-                                    self.cam.ortho = false;
-                                }
-                                self.cam.preset(v);
-                            }
-                        }
-                        if ui.small_button("⛶").on_hover_text("Fit").clicked() {
-                            self.fit_view();
-                        }
-                        ui.toggle_value(&mut self.show_toolpaths, "🛠").on_hover_text("Show toolpaths");
-                        if !self.mode2d {
-                            ui.toggle_value(&mut self.cam.ortho, "▦").on_hover_text("Orthographic");
-                        }
-                    });
-                    let hint = if self.mode2d { "LMB select/draw · RMB/MMB pan · wheel zoom" } else { "LMB orbit · RMB/MMB/Shift pan · wheel zoom" };
-                    ui.label(RichText::new(hint).small().color(theme::STEEL));
+                    Err(e) => app.status = format!("⚠ {e}"),
                 });
-            },
-        );
+            }
+            Err(e) => self.status = format!("⚠ {e}"),
+        }
+    }
+
+    pub fn export_job_sheet(&mut self) {
+        let s = ezyx_project::jobsheet::summarize(&self.project, &self.library, &self.results);
+        let html = ezyx_project::jobsheet::html(&self.project, &s, &self.conflicts);
+        self.files.save("job sheet (HTML)", &["html"], format!("{} job sheet.html", self.project.name), move |app, path| {
+            app.status = match std::fs::write(&path, html) {
+                Ok(()) => format!("Job sheet saved to {}", path.display()),
+                Err(e) => format!("⚠ {e}"),
+            };
+        });
+    }
+
+    pub fn send_to_machine(&mut self) {
+        match ezyx_project::ops::export_gcode(&self.project, &self.library) {
+            Ok((g, warnings)) => {
+                let name = format!("{} (pipeline)", self.project.name);
+                self.machine.add_job(name, g, "pipeline");
+                self.open_module(Module::Machine);
+                self.status = if warnings.is_empty() { "Job sent to Machine Control".into() } else { format!("Job sent — ⚠ {}", warnings.join("; ")) };
+            }
+            Err(e) => self.status = format!("⚠ {e}"),
+        }
+    }
+
+    // ------------------------------------------------------------------ chrome
+
+    fn top_bar(&mut self, ui: &mut egui::Ui, out: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("EZ-YX").strong().color(theme::ACCENT).size(16.0));
+            ui.label(RichText::new("craft").color(theme::STEEL).size(16.0));
+            ui.menu_button("File", |ui| {
+                for (l, a) in [("🗋 New", Action::New), ("📂 Open…", Action::Open), ("💾 Save", Action::Save), ("💾 Save as…", Action::SaveAs)] {
+                    if ui.button(l).clicked() {
+                        out.push(a);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                for (l, a) in [("📐 Import SVG/DXF…", Action::ImportVectors), ("🔺 Import STL/OBJ…", Action::ImportMesh)] {
+                    if ui.button(l).clicked() {
+                        out.push(a);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button("⚙ Settings").clicked() {
+                    out.push(Action::Settings);
+                    ui.close();
+                }
+                if ui.button("ℹ About").clicked() {
+                    out.push(Action::About);
+                    ui.close();
+                }
+            });
+            ui.separator();
+            // Pipeline + modules. In embedded mode these act as tabs.
+            let pipeline_sel = self.focus.is_none();
+            if ribbon::pill(ui, "🛠 Pipeline", pipeline_sel, ezyx_project::registry::modules()[0].summary) {
+                self.focus = None;
+            }
+            for m in Module::ALL {
+                let sel = self.focus == Some(m) || self.open.contains(&m);
+                let label = if self.prefs.separate_windows { format!("{} ↗", m.label()) } else { m.label().to_string() };
+                if ribbon::pill(ui, &label, sel, &ribbon::tip(m.feature_id())) {
+                    out.push(Action::OpenModule(m));
+                }
+            }
+            if self.prefs.separate_windows && ui.button("⧉ Tile").on_hover_text(ribbon::tip("settings.windows")).clicked() {
+                out.push(Action::TileWindows);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let ai =
+                    egui::Button::new(RichText::new("🤖 Assistant").strong()).fill(if self.show_ai { theme::ACCENT_SOFT } else { egui::Color32::TRANSPARENT });
+                if ui.add(ai).on_hover_text(ribbon::tip("assistant.chat")).clicked() {
+                    out.push(Action::ToggleAi);
+                }
+                if ui.button("🌓").on_hover_text("Light / dark").clicked() {
+                    out.push(Action::ToggleDark);
+                }
+                if ui.add_enabled(self.history.can_redo(), egui::Button::new("↪")).on_hover_text("Redo (Ctrl+Y)").clicked() {
+                    out.push(Action::Redo);
+                }
+                if ui.add_enabled(self.history.can_undo(), egui::Button::new("↩")).on_hover_text("Undo (Ctrl+Z)").clicked() {
+                    out.push(Action::Undo);
+                }
+            });
+        });
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -1165,6 +1182,7 @@ impl EzApp {
             return;
         }
         let mut acts = Vec::new();
+        let drawing = matches!(self.tool, DrawTool::Rect | DrawTool::Circle | DrawTool::Ellipse) && self.draw.start.is_some();
         ctx.input(|i| {
             let cmd = i.modifiers.command;
             if cmd && i.key_pressed(egui::Key::Z) {
@@ -1176,11 +1194,33 @@ impl EzApp {
             if cmd && i.key_pressed(egui::Key::S) {
                 acts.push(Action::Save);
             }
-            if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
-                acts.push(Action::Delete);
+            if cmd && i.key_pressed(egui::Key::A) {
+                acts.push(Action::SelectAll);
             }
-            if i.key_pressed(egui::Key::F) && !cmd {
-                acts.push(Action::Fit);
+            for (k, s) in [(egui::Key::Num1, Step::Stock), (egui::Key::Num2, Step::Design), (egui::Key::Num3, Step::Toolpaths), (egui::Key::Num4, Step::Output)]
+            {
+                if cmd && i.key_pressed(k) {
+                    acts.push(Action::GoTo(s));
+                }
+            }
+            if !cmd && !drawing {
+                if i.key_pressed(egui::Key::Delete) {
+                    acts.push(Action::Delete);
+                }
+                if i.key_pressed(egui::Key::F) {
+                    acts.push(Action::Fit);
+                }
+                for (k, t) in [
+                    (egui::Key::R, DrawTool::Rect),
+                    (egui::Key::C, DrawTool::Circle),
+                    (egui::Key::P, DrawTool::Polyline),
+                    (egui::Key::T, DrawTool::Text),
+                    (egui::Key::M, DrawTool::Measure),
+                ] {
+                    if self.step == Step::Design && i.key_pressed(k) {
+                        acts.push(Action::Tool(t));
+                    }
+                }
             }
             if i.key_pressed(egui::Key::Tab) {
                 acts.push(Action::Toggle2D);
@@ -1189,11 +1229,11 @@ impl EzApp {
                 acts.push(Action::Tool(DrawTool::Select));
             }
         });
-        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && self.tool == DrawTool::Polyline {
-            self.finish_polyline();
-        }
         for a in acts {
             if a == Action::Delete && self.selection.is_empty() {
+                continue;
+            }
+            if self.focus.is_some() && matches!(a, Action::Tool(_) | Action::Delete | Action::Toggle2D | Action::Fit | Action::SelectAll) {
                 continue;
             }
             self.handle(a, ctx);
@@ -1201,6 +1241,51 @@ impl EzApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(mut n) = self.gpu_notice.clone() {
+            let mut keep = true;
+            let mut restart = false;
+            egui::Window::new(format!("⚠ {}", n.title)).collapsible(false).resizable(false).anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -40.0]).show(
+                ctx,
+                |ui| {
+                    ui.set_max_width(460.0);
+                    for l in &n.lines {
+                        ui.label(l);
+                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "Rendering on {} ({}){}.",
+                            self.graphics.adapter,
+                            self.graphics.backend,
+                            if self.graphics.software { ", CPU" } else { "" }
+                        ))
+                        .small()
+                        .color(theme::STEEL),
+                    );
+                    ui.horizontal(|ui| {
+                        if n.offer_cpu && crate::platform::MOBILE {
+                            if ui.button(RichText::new("Use safe graphics").strong()).on_hover_text(ribbon::tip("settings.graphics")).clicked() {
+                                restart = true;
+                                keep = false;
+                            }
+                        } else if n.offer_cpu {
+                            if ui.button(RichText::new("Restart with CPU rendering").strong()).on_hover_text(ribbon::tip("settings.graphics")).clicked() {
+                                restart = true;
+                            }
+                            ui.checkbox(&mut n.remember, "always");
+                        }
+                        if ui.button("OK").clicked() {
+                            keep = false;
+                        }
+                    });
+                },
+            );
+            if restart && crate::platform::MOBILE {
+                self.use_safe_graphics();
+            } else if restart {
+                self.restart_renderer(ezyx_gpu::RenderMode::Cpu, n.remember, ctx);
+            }
+            self.gpu_notice = keep.then_some(n);
+        }
         if self.dialogs.about {
             egui::Window::new("About EZ-YX-craft").collapsible(false).resizable(false).open(&mut self.dialogs.about).show(ctx, |ui| {
                 ui.heading(RichText::new("EZ-YX-craft").color(theme::ACCENT));
@@ -1219,6 +1304,100 @@ impl EzApp {
                 }
             });
         }
+        if self.dialogs.settings {
+            let mut open = true;
+            let mut changed = false;
+            let mut restart: Option<ezyx_gpu::RenderMode> = None;
+            egui::Window::new("Settings").collapsible(false).open(&mut open).show(ctx, |ui| {
+                ui.label(RichText::new("Graphics").strong()).on_hover_text(ribbon::tip("settings.graphics"));
+                ui.label(format!(
+                    "{} · {} · {}",
+                    self.graphics.adapter,
+                    self.graphics.backend,
+                    if self.graphics.software { "CPU (software) rendering" } else { "GPU rendering" }
+                ));
+                ui.label(
+                    RichText::new(format!(
+                        "Largest GPU buffer {} MiB · up to {} triangles per frame · simulation up to {} M cells",
+                        self.budget.max_buffer_bytes >> 20,
+                        self.budget.frame_triangles,
+                        self.budget.sim_max_cells / 1_000_000
+                    ))
+                    .small()
+                    .color(theme::STEEL),
+                );
+                let before = (self.prefs.render_mode, self.prefs.gpu_backend, self.prefs.reduced_graphics);
+                if !crate::platform::MOBILE {
+                    // Tablets have no software renderer to fall back to.
+                    ui.horizontal(|ui| {
+                        ui.label("Render with");
+                        ui.radio_value(&mut self.prefs.render_mode, ezyx_gpu::RenderMode::Auto, "Auto")
+                            .on_hover_text("Best compatible GPU; CPU only if no GPU is usable");
+                        ui.radio_value(&mut self.prefs.render_mode, ezyx_gpu::RenderMode::Gpu, "GPU")
+                            .on_hover_text("Always the GPU, even one below the recommended limits");
+                        ui.radio_value(&mut self.prefs.render_mode, ezyx_gpu::RenderMode::Cpu, "CPU")
+                            .on_hover_text("Software renderer: slower, but works with any driver");
+                    });
+                }
+                if ezyx_gpu::GpuBackend::choices().len() > 2 {
+                    ui.horizontal(|ui| {
+                        ui.label("Graphics API");
+                        for b in ezyx_gpu::GpuBackend::choices() {
+                            ui.radio_value(&mut self.prefs.gpu_backend, *b, b.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text("Auto picks the best. OpenGL is the compatibility choice when the 3D view glitches or crashes.");
+                }
+                ui.checkbox(&mut self.prefs.reduced_graphics, "Simplified previews (half the GPU memory)");
+                if (self.prefs.render_mode, self.prefs.gpu_backend, self.prefs.reduced_graphics) != before {
+                    changed = true;
+                    self.dialogs.graphics_changed = true;
+                }
+                if self.dialogs.graphics_changed {
+                    ui.horizontal(|ui| {
+                        if crate::platform::CAN_SPAWN {
+                            ui.label(RichText::new("Takes effect after a restart.").small().color(theme::WARN));
+                            if ui.small_button("Restart now").clicked() {
+                                restart = Some(self.prefs.render_mode);
+                            }
+                        } else {
+                            ui.label(RichText::new("Takes effect the next time you open EZ-YX-craft.").small().color(theme::WARN));
+                        }
+                    });
+                }
+                if !crate::platform::MOBILE {
+                    ui.separator();
+                    ui.label(RichText::new("Windows").strong());
+                    changed |= ui.radio_value(&mut self.prefs.separate_windows, true, "Open modules in separate windows (side by side)").changed();
+                    changed |= ui.radio_value(&mut self.prefs.separate_windows, false, "Show modules as tabs inside the main window").changed();
+                }
+                ui.separator();
+                ui.label(RichText::new("Drawing").strong());
+                changed |= ui.checkbox(&mut self.prefs.snap_grid, "Snap to grid").changed();
+                ui.horizontal(|ui| {
+                    ui.label("Grid");
+                    changed |= ui.add(egui::DragValue::new(&mut self.prefs.grid).range(0.01..=100.0).suffix(" mm")).changed();
+                });
+                changed |= ui.checkbox(&mut self.prefs.snap_objects, "Snap to shape points and stock edges").changed();
+                ui.separator();
+                ui.label(RichText::new("Performance").strong());
+                ui.add(egui::Slider::new(&mut self.perf.sim_cell_mm, 0.05..=1.0).logarithmic(true).text("simulation cell (mm)"));
+                ui.label(RichText::new(ribbon::tip("settings.general")).small().color(theme::STEEL));
+            });
+            if changed {
+                self.prefs.save();
+                if !self.prefs.separate_windows {
+                    self.open.clear();
+                }
+            }
+            if let Some(m) = restart {
+                self.restart_renderer(m, true, ctx);
+            }
+            if !open {
+                self.dialogs.settings = false;
+            }
+        }
         if let Some(at) = self.dialogs.text_at {
             let mut open = true;
             let mut add = false;
@@ -1229,9 +1408,7 @@ impl EzApp {
                     ui.label("Font file (optional):");
                     ui.text_edit_singleline(&mut self.dialogs.font_path);
                     if ui.button("…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().add_filter("Fonts", &["ttf", "otf"]).pick_file() {
-                            self.dialogs.font_path = p.display().to_string();
-                        }
+                        self.files.open("font", &["ttf", "otf"], |app, p| app.dialogs.font_path = p.display().to_string());
                     }
                 });
                 if ui.button(RichText::new("Add").strong()).clicked() {
@@ -1240,6 +1417,7 @@ impl EzApp {
             });
             if add {
                 let font = (!self.dialogs.font_path.is_empty()).then(|| self.dialogs.font_path.clone());
+                let before = self.project.vectors.len();
                 self.exec(Command::AddText {
                     text: self.dialogs.text.clone(),
                     height: self.dialogs.text_height,
@@ -1247,21 +1425,46 @@ impl EzApp {
                     y: at.y as f64,
                     font_path: font,
                 });
+                self.selection = self.project.vectors[before.min(self.project.vectors.len())..].iter().map(|v| v.id).collect();
                 self.dialogs.text_at = None;
             } else if !open {
                 self.dialogs.text_at = None;
             }
         }
-        if let Some(r) = self.dialogs.tet_report.clone() {
+        if let Some((report, clean)) = self.dialogs.merge_report.clone() {
             let mut open = true;
-            egui::Window::new("Tetrahedral mesh").open(&mut open).show(ctx, |ui| {
-                ui.label(r);
-            });
+            egui::Window::new(if clean { "✔ Feature updated" } else { "⚠ Feature updated — check the conflicts" })
+                .collapsible(false)
+                .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(RichText::new(ribbon::tip("pipeline.merge")).small().color(theme::STEEL));
+                    ui.separator();
+                    for l in report.lines() {
+                        let col = if l.starts_with('⚠') {
+                            theme::WARN
+                        } else if l.starts_with('✖') {
+                            theme::DANGER
+                        } else if l.starts_with('✔') {
+                            theme::OK
+                        } else {
+                            ui.visuals().text_color()
+                        };
+                        ui.colored_label(col, l);
+                    }
+                    if ui.button("OK").clicked() {
+                        self.dialogs.merge_report = None;
+                    }
+                });
             if !open {
-                self.dialogs.tet_report = None;
+                self.dialogs.merge_report = None;
             }
         }
     }
+}
+
+pub fn module_viewport(m: Module) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(("ezyx-module", m as u8))
 }
 
 /// Convert a wrapped rotary toolpath back to flat (unwrapped) coordinates for simulation.
@@ -1290,9 +1493,16 @@ impl eframe::App for EzApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_tasks();
+        self.poll_gpu();
         if std::mem::take(&mut self.pending_preview) {
-            self.tab = Tab::Simulate;
-            self.start_preview(&ctx);
+            self.step = Step::Toolpaths;
+            self.simulate(&ctx, true);
+        }
+        if let Some(mut d) = self.docs.take() {
+            let keep = d.tick(self, &ctx);
+            if keep {
+                self.docs = Some(d);
+            }
         }
         self.machine.poll(&ctx);
         self.ai.poll(&mut self.project, &mut self.history, &mut self.rev);
@@ -1300,12 +1510,11 @@ impl eframe::App for EzApp {
             // Keep toolpaths in sync with edits.
             self.calculate(Some(&ctx));
         }
-        self.ensure_part_meshes(&ctx);
+        self.refresh_conflicts();
         self.shortcuts(&ctx);
 
         let mut actions = Vec::new();
-        egui::Panel::top("tabs").show(ui, |ui| ribbon::tabs(ui, &mut self.tab, self.show_ai, &mut actions));
-        egui::Panel::top("ribbon").show(ui, |ui| ribbon::ribbon(ui, self.tab, &mut actions));
+        egui::Panel::top("topbar").show(ui, |ui| self.top_bar(ui, &mut actions));
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if self.tasks.running > 0 {
@@ -1315,29 +1524,52 @@ impl eframe::App for EzApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(self.machine.badge()).color(theme::STEEL));
                     ui.separator();
+                    if self.graphics.software {
+                        if ui
+                            .add(egui::Label::new(RichText::new("⚠ CPU rendering").color(theme::WARN)).sense(egui::Sense::click()))
+                            .on_hover_text(format!("{} ({}) — click for graphics settings", self.graphics.adapter, self.graphics.backend))
+                            .clicked()
+                        {
+                            self.dialogs.settings = true;
+                        }
+                        ui.separator();
+                    }
+                    if self.simplified {
+                        ui.label(RichText::new("◇ simplified view").color(theme::STEEL)).on_hover_text(format!(
+                            "Some geometry is drawn simplified to stay within the GPU budget ({} triangles per frame).",
+                            self.budget.frame_triangles
+                        ));
+                        ui.separator();
+                    }
                     ui.label(RichText::new(format!("{} · {}", self.project.machine.name, self.project.job.material)).color(theme::STEEL));
                 });
             });
         });
-        egui::Panel::left("tree").resizable(true).default_size(250.0).show(ui, |ui| panels::tree::show(self, ui));
         if self.show_ai {
             egui::Panel::right("ai").resizable(true).default_size(360.0).show(ui, |ui| panels::ai::show(self, ui));
         }
-        egui::Panel::right("inspector").resizable(true).default_size(330.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
-                Tab::Machine => panels::machine::show(self, ui),
-                Tab::Image => panels::image::show(self, ui, &mut actions),
-                _ => panels::inspector::show(self, ui),
-            });
-        });
-        egui::CentralPanel::no_frame().show(ui, |ui| self.viewport(ui));
+        match self.focus {
+            Some(m) => {
+                egui::CentralPanel::default().show(ui, |ui| self.module_ui(m, ui));
+            }
+            None => pipeline::show(self, ui, &mut actions),
+        }
+        self.show_module_windows(&ctx);
+        if self.tile_in > 0 {
+            self.tile_in -= 1;
+            if self.tile_in == 0 {
+                self.tile_windows(&ctx);
+            }
+            ctx.request_repaint();
+        }
         self.dialogs(&ctx);
         panels::machine::confirm_dialog(self, &ctx);
         panels::ai::confirm_dialog(self, &ctx);
         for a in actions {
             self.handle(a, &ctx);
         }
-        if self.tasks.running > 0 || self.machine.connected() || self.ai.busy {
+        crate::files::process(self, &ctx);
+        if self.tasks.running > 0 || self.machine.connected() || self.ai.busy || self.docs.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }

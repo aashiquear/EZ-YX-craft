@@ -1,0 +1,55 @@
+# XcodeGen spec for the iPad app (`brew install xcodegen && xcodegen generate`).
+# The Rust side is built first by build-rust.sh, which writes Rust.xcconfig (library search
+# paths + the system frameworks the static library needs). See docs/mobile.md.
+name: EZYXCraft
+options:
+  bundleIdPrefix: org.ezyxcraft
+  deploymentTarget:
+    iOS: "16.0"
+configFiles:
+  Debug: Rust.xcconfig
+  Release: Rust.xcconfig
+targets:
+  EZ-YX-craft:
+    type: application
+    platform: iOS
+    scheme: {}
+    sources:
+      - path: main.m
+      - path: Assets.xcassets
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: EZ-YX-craft
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIRequiresFullScreen: false
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+        # Projects, SVGs, images and G-code live in Documents, visible in the Files app.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        NSLocalNetworkUsageDescription: EZ-YX-craft connects to your CNC controller (GRBL over Wi-Fi) on your local network.
+        # Only HTTPS to the AI provider: exempt from export documentation.
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.ezyxcraft.app
+        PRODUCT_NAME: EZ-YX-craft
+        MARKETING_VERSION: "0.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
+        ENABLE_BITCODE: NO
+        DEAD_CODE_STRIPPING: YES
+        # The Rust library is built for the arm64 simulator only (Apple-silicon Macs).
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+        OTHER_LDFLAGS: $(inherited) -lezyx_mobile $(RUST_LDFLAGS)
