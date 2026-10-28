@@ -17,8 +17,10 @@ for target in aarch64-apple-ios aarch64-apple-ios-sim; do
   # --print native-static-libs lists the frameworks/libraries the static library needs; rustc
   # only prints it when it links, so make sure the crate is rebuilt.
   touch "$root/crates/ezyx-mobile/src/lib.rs"
-  out=$(cd "$root" && cargo rustc $flag -p ezyx-mobile --target "$target" --crate-type staticlib -- --print native-static-libs 2>&1 | tee /dev/stderr)
-  libs=$(printf '%s\n' "$out" | sed -n 's/.*native-static-libs: //p' | tail -1)
+  # No colours: with CARGO_TERM_COLOR=always (CI) the note ends in an ANSI reset that would end up
+  # in the linker flags ("library 'm\e[0m' not found").
+  out=$(cd "$root" && cargo rustc $flag --color never -p ezyx-mobile --target "$target" --crate-type staticlib -- --print native-static-libs 2>&1 | tee /dev/stderr)
+  libs=$(printf '%s\n' "$out" | sed -n 's/.*native-static-libs: //p' | tail -1 | sed "s/$(printf '\033')\[[0-9;]*m//g")
   # -lezyx_mobile must find the static library, not a dylib from an earlier build.
   rm -f "$root/target/$target/$profile/libezyx_mobile.dylib"
 done
