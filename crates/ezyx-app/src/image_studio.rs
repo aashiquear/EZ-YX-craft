@@ -307,7 +307,8 @@ pub fn show(app: &mut EzApp, ui: &mut Ui) {
         strip(ui, "studio_strip", |ui| {
             group(ui, "Image", |ui| {
                 if big_button(ui, "📂", "Load", "Load a photo, pen sketch or logo", false) {
-                    app.image.img.pick(&ctx);
+                    let ctx = ctx.clone();
+                    app.files.open("image", &crate::panels::image::ImageState::EXTS, move |app, p| app.image.img.load(&ctx, &p.display().to_string()));
                     app.image.target = None;
                 }
                 if big_button(

@@ -13,10 +13,17 @@
 //! | AMD TeraScale | HD 5xxx / 6xxx, some HD 7xxx mobile | OpenGL 3.3 (no Vulkan) | Legacy |
 //! | Intel Xe / Arc | Iris Xe, Arc A770 | Vulkan / DX12 | Capable |
 //! | Apple Silicon / AMD on macOS | M1–M4 | Metal | Modern |
+//! | Apple iPad GPUs | A12–A17, M1–M4 | Metal | Modern (A9–A11: Capable) |
+//! | Qualcomm Adreno | Adreno 6xx/7xx/8xx (5xx and older: Legacy) | Vulkan (GLES fallback) | Capable |
+//! | Arm Mali / Immortalis | Mali-G52…G720, Immortalis-G715+ (Mali-T/4xx: Legacy) | Vulkan (GLES fallback) | Capable |
+//! | Samsung Xclipse (RDNA) | Xclipse 920/940 | Vulkan | Capable |
+//! | Imagination PowerVR | GE8320, BXM | GLES / Vulkan | Legacy |
 //!
 //! *Tier* drives defaults: simulation resolution, viewport LOD, and whether compute shaders are
 //! used for drop-cutter/simulation (Modern/Capable) or the rayon CPU path (Legacy/None).
-//! Users can force a backend with `EZYX_GPU_BACKEND=vulkan|dx12|metal|gl` (mapped to `WGPU_BACKEND`).
+//! Users can force a backend with `EZYX_GPU_BACKEND=vulkan|dx12|metal|gl` (mapped to `WGPU_BACKEND`)
+//! or [`GpuBackend`] in Settings › Graphics (the only way on tablets). Phones and tablets get
+//! [`RenderBudget::mobile`] on top: less memory and a slower CPU tessellating the viewport.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +34,12 @@ pub enum Vendor {
     Intel,
     Apple,
     Qualcomm,
+    /// Arm Mali / Immortalis.
+    Arm,
+    /// Imagination PowerVR.
+    ImgTec,
+    /// Samsung Xclipse (AMD RDNA based).
+    Samsung,
     Software,
     Other,
 }
@@ -39,9 +52,53 @@ impl Vendor {
             0x8086 => Vendor::Intel,
             0x106B => Vendor::Apple,
             0x5143 => Vendor::Qualcomm,
-            0x10005 | 0x1414 => Vendor::Software, // Mesa llvmpipe / Microsoft WARP
+            0x13B5 => Vendor::Arm,
+            0x1010 => Vendor::ImgTec,
+            0x144D => Vendor::Samsung,
+            0x10005 | 0x1414 | 0x1AE0 => Vendor::Software, // Mesa llvmpipe / Microsoft WARP / SwiftShader
             _ => Vendor::Other,
         }
+    }
+
+    /// Vendor from the adapter name, for drivers that report no PCI id (Metal on iPad, many
+    /// Android GLES drivers).
+    pub fn from_name(name: &str) -> Self {
+        let n = name.to_ascii_lowercase();
+        let has = |k: &[&str]| k.iter().any(|k| n.contains(k));
+        if has(&["llvmpipe", "lavapipe", "swiftshader", "softpipe", "microsoft basic render"]) {
+            Vendor::Software
+        } else if has(&["adreno"]) {
+            Vendor::Qualcomm
+        } else if has(&["mali", "immortalis"]) {
+            Vendor::Arm
+        } else if has(&["powervr"]) {
+            Vendor::ImgTec
+        } else if has(&["xclipse"]) {
+            Vendor::Samsung
+        } else if has(&["apple"]) {
+            Vendor::Apple
+        } else if has(&["nvidia", "geforce", "quadro"]) {
+            Vendor::Nvidia
+        } else if has(&["radeon", "amd"]) {
+            Vendor::Amd
+        } else if has(&["intel"]) {
+            Vendor::Intel
+        } else {
+            Vendor::Other
+        }
+    }
+
+    /// PCI id first, the name when the id is missing or unknown.
+    pub fn detect(pci: u32, name: &str) -> Self {
+        match Self::from_pci(pci) {
+            Vendor::Other => Self::from_name(name),
+            v => v,
+        }
+    }
+
+    /// Phone/tablet GPU vendors (unified memory, thermally limited).
+    pub fn is_mobile(self) -> bool {
+        matches!(self, Vendor::Qualcomm | Vendor::Arm | Vendor::ImgTec | Vendor::Samsung)
     }
 }
 
@@ -68,6 +125,10 @@ pub enum Family {
     IntelXeArc,
     IntelLegacy,
     AppleSilicon,
+    Adreno,
+    Mali,
+    Xclipse,
+    PowerVr,
     Unknown,
 }
 
@@ -137,7 +198,24 @@ pub fn classify(vendor: Vendor, name: &str) -> (Family, Tier, Vec<String>) {
                 (Family::IntelLegacy, Tier::Legacy, vec!["Older Intel HD: reduced viewport detail by default.".into()])
             }
         }
-        Vendor::Apple => (Family::AppleSilicon, Tier::Modern, vec![]),
+        // iPad A9–A11 (2015–2017) are slower; A12+ and M-series are fine.
+        Vendor::Apple => match num("apple a") {
+            Some(a) if a < 12 => (Family::AppleSilicon, Tier::Capable, vec![]),
+            _ => (Family::AppleSilicon, Tier::Modern, vec![]),
+        },
+        Vendor::Qualcomm => match num("adreno (tm)").or_else(|| num("adreno")) {
+            Some(a) if a < 600 => (Family::Adreno, Tier::Legacy, vec!["Adreno 5xx or older: reduced viewport detail.".into()]),
+            _ => (Family::Adreno, Tier::Capable, vec![]),
+        },
+        Vendor::Arm => {
+            if n.contains("immortalis") || num("mali-g").is_some_and(|g| g >= 52) {
+                (Family::Mali, Tier::Capable, vec!["Mali: if the 3D view glitches, choose Settings › Graphics › OpenGL ES.".into()])
+            } else {
+                (Family::Mali, Tier::Legacy, vec!["Older Mali (T-series / G31): OpenGL ES, reduced viewport detail.".into()])
+            }
+        }
+        Vendor::Samsung => (Family::Xclipse, Tier::Capable, vec![]),
+        Vendor::ImgTec => (Family::PowerVr, Tier::Legacy, vec!["PowerVR: OpenGL ES recommended (Settings › Graphics).".into()]),
         Vendor::Software => (Family::Unknown, Tier::None, vec!["Software renderer: install the GPU driver for usable 3D.".into()]),
         _ => (Family::Unknown, Tier::Capable, vec![]),
     }
@@ -182,6 +260,60 @@ impl RenderMode {
             "gpu" => Some(RenderMode::Gpu),
             "cpu" | "software" => Some(RenderMode::Cpu),
             _ => None,
+        }
+    }
+}
+
+/// Graphics API preference (Settings › Graphics). `EZYX_GPU_BACKEND` / `WGPU_BACKEND` win over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GpuBackend {
+    /// Every API this platform has; the best adapter wins.
+    #[default]
+    Auto,
+    Vulkan,
+    Metal,
+    Dx12,
+    /// OpenGL / OpenGL ES — the compatibility choice (old GPUs, buggy mobile Vulkan drivers).
+    Gl,
+}
+
+impl GpuBackend {
+    pub fn label(self) -> &'static str {
+        match self {
+            GpuBackend::Auto => "Auto",
+            GpuBackend::Vulkan => "Vulkan",
+            GpuBackend::Metal => "Metal",
+            GpuBackend::Dx12 => "DirectX 12",
+            GpuBackend::Gl => {
+                if cfg!(any(target_os = "android", target_os = "ios")) {
+                    "OpenGL ES"
+                } else {
+                    "OpenGL"
+                }
+            }
+        }
+    }
+
+    /// The choices that make sense on the platform this was built for.
+    pub fn choices() -> &'static [GpuBackend] {
+        if cfg!(any(target_os = "macos", target_os = "ios")) {
+            &[GpuBackend::Auto, GpuBackend::Metal]
+        } else if cfg!(target_os = "windows") {
+            &[GpuBackend::Auto, GpuBackend::Dx12, GpuBackend::Vulkan, GpuBackend::Gl]
+        } else {
+            &[GpuBackend::Auto, GpuBackend::Vulkan, GpuBackend::Gl]
+        }
+    }
+
+    /// wgpu backends to enumerate (`None` = wgpu's default set).
+    #[cfg(feature = "wgpu")]
+    pub fn backends(self) -> Option<wgpu::Backends> {
+        match self {
+            GpuBackend::Auto => None,
+            GpuBackend::Vulkan => Some(wgpu::Backends::VULKAN),
+            GpuBackend::Metal => Some(wgpu::Backends::METAL),
+            GpuBackend::Dx12 => Some(wgpu::Backends::DX12),
+            GpuBackend::Gl => Some(wgpu::Backends::GL),
         }
     }
 }
@@ -333,7 +465,25 @@ pub fn render_budget(max_buffer_bytes: u64, software: bool, tier: Tier) -> Rende
     RenderBudget { max_buffer_bytes, frame_vertices, frame_triangles: frame, preview_triangles: frame * 6 / 10, mesh_triangles: frame * 4 / 10, sim_max_cells }
 }
 
+/// Ceiling for phones and tablets: the viewport is tessellated by a phone CPU and GPU memory is
+/// shared with the OS (the app is killed, not warned, when it takes too much).
+pub const MOBILE_FRAME_TRIANGLES: usize = 900_000;
+pub const MOBILE_SIM_CELLS: usize = 12_000_000;
+
 impl RenderBudget {
+    /// Cap the budget for a phone/tablet (never raises it).
+    pub fn mobile(self) -> Self {
+        let f = self.frame_triangles.min(MOBILE_FRAME_TRIANGLES);
+        RenderBudget {
+            frame_vertices: self.frame_vertices.min(MOBILE_FRAME_TRIANGLES * 3 * 2),
+            frame_triangles: f,
+            preview_triangles: f * 6 / 10,
+            mesh_triangles: f * 4 / 10,
+            sim_max_cells: self.sim_max_cells.min(MOBILE_SIM_CELLS),
+            ..self
+        }
+    }
+
     /// After an out-of-memory / oversize-buffer error: halve everything (never below a floor).
     pub fn reduced(self) -> Self {
         let f = (self.frame_triangles / 2).max(5_000);
@@ -359,7 +509,7 @@ pub fn facts(adapters: &[wgpu::Adapter], surface: Option<&wgpu::Surface<'_>>) ->
             let software = info.device_type == wgpu::DeviceType::Cpu || info.name.to_ascii_lowercase().contains("llvmpipe");
             AdapterFacts {
                 name: info.name.clone(),
-                vendor: if software { Vendor::Software } else { Vendor::from_pci(info.vendor) },
+                vendor: if software { Vendor::Software } else { Vendor::detect(info.vendor, &info.name) },
                 software,
                 discrete: info.device_type == wgpu::DeviceType::DiscreteGpu,
                 backend: format!("{:?}", info.backend),
@@ -396,7 +546,7 @@ pub fn probe() -> Vec<GpuInfo> {
         .into_iter()
         .map(|a| {
             let info = a.get_info();
-            let vendor = if info.device_type == wgpu::DeviceType::Cpu { Vendor::Software } else { Vendor::from_pci(info.vendor) };
+            let vendor = if info.device_type == wgpu::DeviceType::Cpu { Vendor::Software } else { Vendor::detect(info.vendor, &info.name) };
             let (family, mut tier, mut notes) = classify(vendor, &info.name);
             if info.backend == wgpu::Backend::Gl && tier > Tier::Legacy {
                 notes.push("Only exposed through OpenGL on this system — check drivers for Vulkan/DX12.".into());
@@ -447,6 +597,44 @@ mod tests {
         assert_eq!(classify(Vendor::Amd, "AMD Radeon R9 290").0, Family::AmdGcn);
         assert_eq!(classify(Vendor::Intel, "Intel(R) Arc(TM) A770").0, Family::IntelXeArc);
         assert_eq!(classify(Vendor::Apple, "Apple M2").1, Tier::Modern);
+    }
+
+    #[test]
+    fn mobile_gpus() {
+        // Metal on iPad and many Android GLES drivers report no PCI vendor id.
+        assert_eq!(Vendor::detect(0, "Apple A15 GPU"), Vendor::Apple);
+        assert_eq!(Vendor::detect(0, "Adreno (TM) 740"), Vendor::Qualcomm);
+        assert_eq!(Vendor::detect(0x13B5, "Mali-G78"), Vendor::Arm);
+        assert_eq!(Vendor::detect(0, "Mali-G610 MC6"), Vendor::Arm);
+        assert_eq!(Vendor::detect(0x1AE0, "SwiftShader Device (Subzero)"), Vendor::Software);
+        assert_eq!(Vendor::detect(0, "Google SwiftShader"), Vendor::Software);
+        assert_eq!(Vendor::detect(0x10DE, "anything"), Vendor::Nvidia);
+        assert!(Vendor::Qualcomm.is_mobile() && !Vendor::Apple.is_mobile());
+
+        assert_eq!(classify(Vendor::Apple, "Apple A15 GPU").1, Tier::Modern);
+        assert_eq!(classify(Vendor::Apple, "Apple A10X GPU").1, Tier::Capable);
+        assert_eq!(classify(Vendor::Qualcomm, "Adreno (TM) 740"), (Family::Adreno, Tier::Capable, vec![]));
+        assert_eq!(classify(Vendor::Qualcomm, "Adreno (TM) 530").1, Tier::Legacy);
+        assert_eq!(classify(Vendor::Arm, "Mali-G78").1, Tier::Capable);
+        assert_eq!(classify(Vendor::Arm, "Mali-G31").1, Tier::Legacy);
+        assert_eq!(classify(Vendor::Arm, "Mali-T880").1, Tier::Legacy);
+        assert_eq!(classify(Vendor::Arm, "Immortalis-G720").1, Tier::Capable);
+        assert_eq!(classify(Vendor::ImgTec, "PowerVR Rogue GE8320").1, Tier::Legacy);
+    }
+
+    #[test]
+    fn mobile_budget_caps() {
+        // A 1 GiB-buffer iPad still tessellates at most 900 k triangles per frame and keeps the
+        // simulation under 60 MB.
+        let b = render_budget(1 << 30, false, Tier::Modern).mobile();
+        assert_eq!(b.frame_triangles, MOBILE_FRAME_TRIANGLES);
+        assert!(b.preview_triangles + b.mesh_triangles <= b.frame_triangles);
+        assert!(b.frame_triangles * 3 <= b.frame_vertices / 2);
+        assert!(b.sim_max_cells * 5 <= 60_000_000);
+        // Never raises a smaller budget.
+        let small = render_budget(64 << 20, false, Tier::Legacy);
+        assert_eq!(small.mobile().frame_triangles, small.frame_triangles);
+        assert_eq!(small.mobile().frame_vertices, small.frame_vertices);
     }
     fn hw(name: &str, vendor: Vendor, backend: &str, buf_mib: u64) -> AdapterFacts {
         AdapterFacts {

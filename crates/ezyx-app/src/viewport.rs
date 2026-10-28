@@ -159,9 +159,27 @@ impl Projector {
 /// Navigation. Returns true when the camera changed.
 /// * 3D: LMB-drag orbit (unless `lmb_reserved`), RMB/MMB or Shift+LMB pan, wheel/pinch zoom to cursor.
 /// * 2D: LMB is reserved for selection/drawing; RMB/MMB pan, wheel zoom.
+/// * Touch (tablets, touch screens): one finger acts as LMB, two fingers pan + pinch-zoom, and
+///   twisting two fingers turns the 3D view.
 pub fn navigate(ui: &Ui, resp: &Response, cam: &mut Camera, rect: Rect, lmb_reserved: bool) -> bool {
     let mut changed = false;
     let shift = ui.input(|i| i.modifiers.shift);
+    if let Some(t) = ui.input(|i| i.multi_touch()).filter(|t| rect.contains(t.center_pos)) {
+        // Two fingers: pan with the centre, turn with the twist (zoom comes through zoom_delta).
+        let pr = Projector::new(cam, rect);
+        let z = cam.target.z;
+        if let (Some(a), Some(b)) = (pr.ground(t.center_pos - t.translation_delta, z), pr.ground(t.center_pos, z)) {
+            cam.target -= b - a;
+        }
+        if !cam.ortho_locked_2d() {
+            cam.yaw -= t.rotation_delta;
+        }
+        let factor = 1.0 / t.zoom_delta.max(1e-3);
+        if (factor - 1.0).abs() > 1e-5 {
+            cam.dist = (cam.dist * factor).clamp(1.0, 50_000.0);
+        }
+        return true;
+    }
     let pan_drag = resp.dragged_by(egui::PointerButton::Secondary)
         || resp.dragged_by(egui::PointerButton::Middle)
         || (shift && resp.dragged_by(egui::PointerButton::Primary));

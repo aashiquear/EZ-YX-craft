@@ -1,12 +1,12 @@
 //! Byte transports. All are used from the controller's IO thread with short read timeouts.
 
-#[cfg(feature = "serial")]
+#[cfg(serial)]
 mod serial;
 mod sim;
 mod tcp;
 mod ws;
 
-#[cfg(feature = "serial")]
+#[cfg(serial)]
 pub use serial::SerialTransport;
 pub use sim::SimulatedGrbl;
 pub use tcp::TcpTransport;
@@ -49,10 +49,12 @@ pub enum Endpoint {
 impl Endpoint {
     pub fn open(&self) -> Result<Box<dyn Transport>, MachineError> {
         Ok(match self {
-            #[cfg(feature = "serial")]
+            #[cfg(serial)]
             Endpoint::Serial { port, baud } => Box::new(SerialTransport::open(port, *baud)?),
-            #[cfg(not(feature = "serial"))]
-            Endpoint::Serial { .. } => return Err(MachineError::Serial("built without serial support".into())),
+            #[cfg(not(serial))]
+            Endpoint::Serial { .. } => {
+                return Err(MachineError::Serial("USB serial is not available in this build (on iPad/Android connect over Wi-Fi)".into()))
+            }
             Endpoint::Tcp { host, port } => Box::new(TcpTransport::connect(host, *port)?),
             Endpoint::WebSocket { url } => Box::new(WsTransport::connect(url)?),
             Endpoint::Simulator => Box::new(SimulatedGrbl::new()),

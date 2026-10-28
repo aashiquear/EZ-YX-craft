@@ -10,7 +10,9 @@
 //! * **Per-frame vertex budget** ([`take_triangles`], [`take_segments`]): egui uploads all of a window's vertices
 //!   into one vertex buffer per frame, so the viewport never asks for more than the device can
 //!   hold (the reported crash was a 321 MB buffer on a 256 MiB limit).
-//! * **Restart in another mode** ([`restart`]).
+//! * **Restart in another mode** ([`restart`]) — desktop only. iPadOS/Android apps can't relaunch
+//!   themselves, so there a graphics crash leaves a marker ([`take_crash_marker`]) and the next
+//!   start uses simplified previews (and OpenGL ES on Android) and reopens the recovery copy.
 
 use eframe::{egui_wgpu, wgpu};
 use ezyx_gpu::{AdapterChoice, RenderMode};
@@ -68,21 +70,61 @@ pub fn set_recovery_path(p: std::path::PathBuf) {
     }
 }
 
+fn crash_marker() -> Option<std::path::PathBuf> {
+    crate::platform::config_dir().map(|d| d.join("ezyx-craft").join("gpu-crash.txt"))
+}
+
+static PREVIOUS_CRASH: Mutex<Option<(String, Option<std::path::PathBuf>)>> = Mutex::new(None);
+
+/// Read (and delete) the marker a graphics crash left on the last run: the error and the
+/// recovery copy to reopen. Call once at start-up; [`previous_crash`] returns it afterwards.
+#[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(dead_code))]
+pub fn take_crash_marker() -> Option<String> {
+    let p = crash_marker()?;
+    let text = std::fs::read_to_string(&p).ok()?;
+    let _ = std::fs::remove_file(&p);
+    let mut lines = text.lines();
+    let msg = lines.next().unwrap_or("graphics error").to_string();
+    let recovery = lines.next().map(std::path::PathBuf::from).filter(|p| p.is_file());
+    if let Ok(mut c) = PREVIOUS_CRASH.lock() {
+        *c = Some((msg.clone(), recovery));
+    }
+    Some(msg)
+}
+
+/// The graphics crash of the last run (mobile), with the recovery copy to reopen.
+pub fn previous_crash() -> Option<(String, Option<std::path::PathBuf>)> {
+    PREVIOUS_CRASH.lock().ok().and_then(|c| c.clone())
+}
+
 /// Last line of defence: if a graphics panic still happens (inside the driver or egui's
-/// renderer), start the app again with CPU rendering on the latest recovery copy.
+/// renderer), start the app again with CPU rendering on the latest recovery copy (desktop), or
+/// leave a marker so the next start is in safe graphics mode (mobile).
 pub fn install_panic_fallback(mode: RenderMode) {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default(info);
         let msg = info.payload().downcast_ref::<String>().cloned().or_else(|| info.payload().downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
         let gpu = ["wgpu", "vertex buffer", "staging buffer", "index buffer", "surface", "Device"].iter().any(|k| msg.contains(k));
-        if !gpu || mode == RenderMode::Cpu || std::env::var_os("EZYX_GPU_FAILED").is_some() {
+        if !gpu {
+            return;
+        }
+        let first = msg.lines().next().unwrap_or("graphics error").to_string();
+        if !crate::platform::CAN_SPAWN {
+            if let Some(p) = crash_marker() {
+                let recovery = RECOVERY.lock().ok().and_then(|r| r.clone()).map(|r| r.display().to_string()).unwrap_or_default();
+                let _ = std::fs::create_dir_all(p.parent().unwrap_or(&p));
+                let _ = std::fs::write(p, format!("{first}\n{recovery}\n"));
+            }
+            return;
+        }
+        if mode == RenderMode::Cpu || std::env::var_os("EZYX_GPU_FAILED").is_some() {
             return;
         }
         if let Ok(exe) = std::env::current_exe() {
             let mut cmd = std::process::Command::new(exe);
             // Safe defaults in the new process: drop test overrides that may have caused the crash.
-            cmd.env("EZYX_RENDER", "cpu").env("EZYX_GPU_FAILED", msg.lines().next().unwrap_or("graphics error")).env_remove("EZYX_FRAME_BUDGET");
+            cmd.env("EZYX_RENDER", "cpu").env("EZYX_GPU_FAILED", first).env_remove("EZYX_FRAME_BUDGET");
             if let Some(p) = RECOVERY.lock().ok().and_then(|r| r.clone()) {
                 cmd.arg(p);
             }
@@ -169,9 +211,10 @@ pub fn take_exceeded() -> bool {
     EXCEEDED.swap(false, Ordering::Relaxed)
 }
 
-/// eframe/wgpu options: our adapter selector, and device limits raised to what the adapter can do
-/// (bigger buffers on capable GPUs) without ever asking for more than it supports.
-pub fn wgpu_options(mode: RenderMode) -> egui_wgpu::WgpuConfiguration {
+/// eframe/wgpu options: our adapter selector, the graphics API preference (unless
+/// `WGPU_BACKEND` is set), and device limits raised to what the adapter can do (bigger buffers on
+/// capable GPUs) without ever asking for more than it supports.
+pub fn wgpu_options(mode: RenderMode, backend: ezyx_gpu::GpuBackend) -> egui_wgpu::WgpuConfiguration {
     let selector: egui_wgpu::NativeAdapterSelectorMethod = Arc::new(move |adapters, surface| {
         let facts = ezyx_gpu::facts(adapters, surface);
         for f in &facts {
@@ -186,6 +229,9 @@ pub fn wgpu_options(mode: RenderMode) -> egui_wgpu::WgpuConfiguration {
         Ok(adapters[index].clone())
     });
     let mut create = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    if let (Some(b), None) = (backend.backends(), std::env::var_os("WGPU_BACKEND")) {
+        create.instance_descriptor.backends = b;
+    }
     create.native_adapter_selector = Some(selector);
     create.device_descriptor = Arc::new(|adapter: &wgpu::Adapter| {
         let a = adapter.limits();
@@ -212,6 +258,9 @@ fn test_buffer_cap() -> u64 {
 
 /// Start a fresh copy of the app in `mode` (optionally opening `project`) and close this one.
 pub fn restart(mode: RenderMode, project: Option<&std::path::Path>, ctx: &egui::Context) -> Result<(), String> {
+    if !crate::platform::CAN_SPAWN {
+        return Err(format!("{} apps can't restart themselves — close EZ-YX-craft and open it again", crate::platform::name()));
+    }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut cmd = std::process::Command::new(exe);
     cmd.env(
@@ -245,6 +294,22 @@ mod tests {
         assert!(!take_exceeded());
         // …and the next pass starts over.
         assert_eq!(take_in_pass(&ctx, 2, 70_000), 70_000);
+    }
+
+    #[test]
+    fn crash_marker_round_trip() {
+        // The marker format the mobile panic hook writes: message, then the recovery copy.
+        let Some(p) = crash_marker() else { return };
+        let had = std::fs::read_to_string(&p).ok();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "wgpu error: device lost\n/nonexistent/recovery.ezyx\n").unwrap();
+        assert_eq!(take_crash_marker().as_deref(), Some("wgpu error: device lost"));
+        assert!(!p.exists());
+        assert_eq!(previous_crash(), Some(("wgpu error: device lost".to_string(), None)));
+        assert!(take_crash_marker().is_none());
+        if let Some(t) = had {
+            let _ = std::fs::write(&p, t);
+        }
     }
 
     #[test]

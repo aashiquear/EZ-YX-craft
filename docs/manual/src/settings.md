@@ -33,6 +33,9 @@ rendering instead of crashing.
    budgets.
 3. Choose **Render with**: **Auto**, **GPU** or **CPU**, then click **Restart now**. You can also start
    once in a mode with `EZYX_RENDER=cpu ez-yx-craft`.
+4. **Graphics API** picks Vulkan, DirectX 12, Metal or OpenGL (**Auto** uses the best);
+   **Simplified previews** halves the GPU memory the views use. Tablets have no CPU renderer
+   and can't restart themselves: these settings apply the next time you open the app.
 
 What the app does for you:
 
@@ -45,6 +48,7 @@ What the app does for you:
 | A preview would exceed the GPU's buffer limit | Drawn simplified (**◇ simplified view** in the status bar) |
 | The GPU runs out of memory or rejects a buffer | Budgets are halved, the view is simplified, you're offered a CPU restart |
 | The GPU device is lost or the renderer crashes | Your project is saved to a recovery copy and the app restarts with CPU rendering |
+| Tablet: the graphics driver crashed | Next start uses simplified previews (and OpenGL ES on Android) and reopens the recovery copy |
 
 > **Tip:** After a restart the recovered project has no file name — use **File › Save as…** to keep
 > it. A recovery copy is written at most once a minute while you work.
@@ -67,3 +71,48 @@ Millimetres or inches, light or dark theme, snapping, and simulation detail (set
 
 *Available since version 0.2.0.*
 <!-- /feature:settings.general -->
+
+<!-- feature:settings.tablets -->
+## iPad and Android tablets
+
+The same EZ-YX-craft runs on iPad and Android tablets, with the same pipeline, modules, simulation
+and Machine Control. A few things work differently on a tablet:
+
+* **One window.** Image Studio, Solid Modeler and Machine Control open as tabs next to
+  **🛠 Pipeline**.
+* **Touch.** See the table below. A keyboard and mouse or trackpad work as on a computer.
+* **Files.** Files live in the app's own folder, and **Open**, **Save** and the imports use an
+  in-app file browser.
+* **Wi-Fi only.** Tablets can't open USB serial ports, so connect to the machine with
+  **📶 Wi-Fi TCP** or **📶 WebSocket**.
+
+**Steps**
+
+1. Install the app: the **iPad** `.ipa` or the **Android** `.apk` from the release page (or
+   TestFlight / Google Play when published).
+2. Copy projects, SVG/DXF files, images and G-code into the app's folder:
+   * **iPad:** Files app › **On My iPad › EZ-YX-craft** (AirDrop or **Share › Save to Files**
+     work too).
+   * **Android:** `Android/data/org.ezyxcraft.app/files` over USB or with a file manager.
+3. Open and save from the in-app file browser (**📂 Open** / **💾 Save**). Tap a folder to go
+   into it and **⬆ Up** to come back.
+
+![The in-app file browser used on iPad and Android](img/tablet_files.png)
+
+4. In **Machine Control** choose **📶 Wi-Fi TCP** or **📶 WebSocket**, enter the controller's
+   address and **Connect**. On iPad, allow **Local Network** access when asked.
+
+| Gesture | In 3D views | In the 2D design view |
+|---|---|---|
+| One finger drag | Orbit | Select / draw (like the left mouse button) |
+| Two fingers drag | Pan | Pan |
+| Pinch | Zoom | Zoom |
+| Two-finger twist | Turn the view | — |
+
+> **Tip:** If the 3D view glitches or the app closes while drawing, choose **Use safe graphics**
+> in the ⚠ Graphics message, or tick **Simplified previews** in **⚙ Settings › Graphics** (on
+> Android you can also pick **OpenGL ES** there). After a graphics crash the app starts in safe
+> mode by itself and reopens your work.
+
+*Available since version 0.2.0.*
+<!-- /feature:settings.tablets -->

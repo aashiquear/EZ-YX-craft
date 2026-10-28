@@ -37,11 +37,7 @@ impl ImageState {
         self.gray.as_ref().map(|g| g.height as f64 / g.width.max(1) as f64).unwrap_or(1.0)
     }
 
-    pub fn pick(&mut self, ctx: &egui::Context) {
-        if let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff", "webp"]).pick_file() {
-            self.load(ctx, &p.display().to_string());
-        }
-    }
+    pub const EXTS: [&str; 8] = ["png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff", "webp"];
 
     pub fn load(&mut self, ctx: &egui::Context, path: &str) {
         match image::open(path) {

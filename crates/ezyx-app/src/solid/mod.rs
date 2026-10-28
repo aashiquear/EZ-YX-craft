@@ -481,7 +481,7 @@ fn command_manager(app: &mut EzApp, ui: &mut Ui) {
                 if big_button(ui, "🔷", "Tet mesh", "Volumetric tet mesh (VTK + Gmsh) for analysis", false) {
                     export_tet(app);
                 }
-                if big_button(ui, "🔗", "SolidCraft", &tip("solid.solidcraft"), false) {
+                if crate::platform::CAN_SPAWN && big_button(ui, "🔗", "SolidCraft", &tip("solid.solidcraft"), false) {
                     open_in_solidcraft(app);
                 }
             });
@@ -696,6 +696,9 @@ fn export_panel(app: &mut EzApp, ui: &mut Ui) {
             send_to_pipeline(app, r, true);
         }
     }
+    if !crate::platform::CAN_SPAWN {
+        return;
+    }
     ui.separator();
     ui.label(RichText::new("SolidCraft bridge").strong());
     ui.label(RichText::new(tip("solid.solidcraft")).small().color(theme::STEEL));
@@ -768,13 +771,14 @@ fn send_to_pipeline(app: &mut EzApp, as_relief: bool, update: bool) {
 fn export_mesh(app: &mut EzApp, ext: &str) {
     let Some(part) = app.solid.draft.clone() else { return };
     let mesh = part.mesh(app.solid.resolution.min(0.4));
-    if let Some(path) = rfd::FileDialog::new().add_filter(ext.to_uppercase(), &[ext]).set_file_name(format!("{}.{ext}", part.name)).save_file() {
-        let r = if ext == "obj" { ezyx_mesh::io::write_obj(&mesh, &path) } else { ezyx_mesh::io::write_stl(&mesh, &path) };
+    let obj = ext == "obj";
+    app.files.save(&format!("mesh ({})", ext.to_uppercase()), &[ext], format!("{}.{ext}", part.name), move |app, path| {
+        let r = if obj { ezyx_mesh::io::write_obj(&mesh, &path) } else { ezyx_mesh::io::write_stl(&mesh, &path) };
         app.solid.status = match r {
             Ok(()) => format!("Exported {}", path.display()),
             Err(e) => format!("⚠ {e}"),
         };
-    }
+    });
 }
 
 fn export_tet(app: &mut EzApp) {
@@ -785,13 +789,12 @@ fn export_tet(app: &mut EzApp) {
         "{} tetrahedra · {:.1} mm³ · dihedral {:.1}°–{:.1}° · radius ratio min {:.2}",
         q.count, q.volume, q.min_dihedral, q.max_dihedral, q.min_radius_ratio
     );
-    if let Some(path) = rfd::FileDialog::new().add_filter("VTK", &["vtk"]).set_file_name(format!("{}.vtk", part.name)).save_file() {
+    app.solid.status = report.clone();
+    app.files.save("tet mesh (VTK + Gmsh)", &["vtk"], format!("{}.vtk", part.name), move |app, path| {
         let _ = std::fs::write(&path, tm.to_vtk());
         let _ = std::fs::write(path.with_extension("msh"), tm.to_gmsh());
         app.solid.status = format!("{report} — saved {} and .msh", path.display());
-    } else {
-        app.solid.status = report;
-    }
+    });
 }
 
 fn solidcraft_path() -> Option<std::path::PathBuf> {

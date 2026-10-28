@@ -67,15 +67,13 @@ fn jobs(app: &mut EzApp, ui: &mut Ui) {
     ui.label(RichText::new("Jobs").strong()).on_hover_text(tip("machine.jobs"));
     ui.horizontal(|ui| {
         if ui.button("📂 Load G-code…").clicked() {
-            if let Some(p) = rfd::FileDialog::new().add_filter("G-code", &["nc", "gcode", "ngc", "tap", "cnc", "gc", "txt"]).pick_file() {
-                match std::fs::read_to_string(&p) {
-                    Ok(g) => {
-                        let name = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-                        app.machine.add_job(name, g, &p.display().to_string());
-                    }
-                    Err(e) => app.machine.error = Some(e.to_string()),
+            app.files.open("G-code", &["nc", "gcode", "ngc", "tap", "cnc", "gc", "txt"], |app, p| match std::fs::read_to_string(&p) {
+                Ok(g) => {
+                    let name = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                    app.machine.add_job(name, g, &p.display().to_string());
                 }
-            }
+                Err(e) => app.machine.error = Some(e.to_string()),
+            });
         }
         if ui.button("⬇ From pipeline").on_hover_text(tip("pipeline.send_machine")).clicked() {
             app.send_to_machine();

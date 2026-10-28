@@ -578,12 +578,26 @@ pub fn features() -> Vec<Feature> {
             "Graphics: GPU checks and CPU fallback",
             "At start-up EZ-YX-craft checks the graphics adapters. GPUs that can't run the viewport (no driver, tiny buffer or texture limits, can't draw to the window) are skipped, and if none is usable the app renders on the CPU instead and tells you why. While you work, previews are sized to the GPU's buffer limit; if the GPU still runs out of memory the app simplifies the view and offers to restart with CPU rendering instead of crashing.",
             [
-                "If a ⚠ Graphics message appears, read why and choose Restart with CPU rendering or OK.",
+                "If a ⚠ Graphics message appears, read why and choose Restart with CPU rendering (Use safe graphics on a tablet) or OK.",
                 "File › ⚙ Settings › Graphics shows the adapter in use and its limits.",
-                "Choose Render with Auto, GPU or CPU and click Restart now (or start with EZYX_RENDER=cpu)."
+                "Choose Render with Auto, GPU or CPU, the Graphics API, or Simplified previews, then click Restart now (or start with EZYX_RENDER=cpu)."
             ],
             [],
-            ["gpu", "graphics", "driver", "cpu rendering", "software", "out of memory", "crash"]
+            ["gpu", "graphics", "driver", "cpu rendering", "software", "out of memory", "crash", "vulkan", "opengl", "metal"]
+        ),
+        feat!(
+            "settings.tablets",
+            "settings",
+            "settings.md",
+            "iPad and Android tablets",
+            "The same app runs on iPad and Android tablets: modules open as tabs, one finger draws and orbits, two fingers pan, pinch and turn the view. Files live in the app's own folder, and the machine is reached over Wi-Fi (tablets can't open USB serial ports).",
+            [
+                "Install the iPad IPA or the Android APK from the release page (or TestFlight / Google Play when published).",
+                "Copy projects, SVG/DXF, images and G-code into the app's folder: Files app › On My iPad › EZ-YX-craft, or Android/data/org.ezyxcraft.app/files.",
+                "Open and save from the in-app file browser; connect to the machine with 📶 Wi-Fi TCP or WebSocket in Machine Control."
+            ],
+            ["tablet_files"],
+            ["ipad", "android", "tablet", "mobile", "touch", "gestures", "files app", "wi-fi"]
         ),
         feat!(
             "settings.general",
@@ -610,6 +624,7 @@ pub fn shots() -> Vec<Shot> {
         s("solid_modeler", "solid", "features", &["template:0"], "Solid Modeler with a parametric template"),
         s("solid_sketch", "solid", "sketch", &["sketch_demo"], "Constrained sketch with driving dimensions"),
         s("machine_control", "machine", "control", &["connect_sim"], "Machine Control connected to the simulator"),
+        s("tablet_files", "pipeline", "design", &["file_browser:examples"], "The in-app file browser used on iPad and Android"),
     ]
 }
 

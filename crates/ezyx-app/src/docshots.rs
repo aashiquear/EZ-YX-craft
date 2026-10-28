@@ -130,6 +130,7 @@ fn setup(app: &mut EzApp, ctx: &egui::Context, s: &ShotSpec) -> Result<(), Strin
     app.passes = PassFilter::Both;
     app.show_ai = false;
     app.dialogs.merge_report = None;
+    app.files = Default::default();
     if s.project.is_empty() {
         app.project = ezyx_project::demo::sign("OAK")?;
         app.history = Default::default();
@@ -181,6 +182,12 @@ fn setup(app: &mut EzApp, ctx: &egui::Context, s: &ShotSpec) -> Result<(), Strin
                 crate::solid::new_part(app, p);
                 app.solid.tab = crate::solid::SolidTab::Sketch;
                 app.solid.sketch = Some(crate::solid::SketchEdit::new(Some(0), sk.unwrap_or_else(|| ezyx_cad::Sketch::rectangle(60.0, 40.0))));
+            }
+            "file_browser" => {
+                // The iPad/Android file browser, over a fixed folder so the shot is deterministic.
+                app.files.force_in_app = true;
+                app.files.root = Some(std::path::PathBuf::from(v));
+                app.files.open("EZ-YX-craft project", &["ezyx"], |app, p| app.load_project(&p));
             }
             "connect_sim" => {
                 crate::machine_control::connect_sim(app);

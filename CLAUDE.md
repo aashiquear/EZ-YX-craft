@@ -7,7 +7,8 @@ design notes. Keep this file current when you change architecture, conventions o
 EZ-YX-craft is an open-source (MIT OR Apache-2.0) Rust desktop app for CNC wood & metal carving:
 2D/2.5D/3D design, CAD part modelling, meshing (incl. tet meshes), image→carve pipelines,
 toolpaths, G-code posts, material-removal preview, machine control over USB/Wi-Fi, and an
-LLM assistant that operates the app through tools. Targets Linux (Ubuntu), macOS, Windows.
+LLM assistant that operates the app through tools. Targets Linux (Ubuntu), macOS, Windows, iPad
+and Android tablets (same app, see docs/mobile.md).
 Inspiration (features, not code or assets): Vectric VCarve/Aspire (power) + Easel (friendliness).
 Owner: Aashique (machine: Genmitsu 4040 PRO MAX with Wi-Fi module; dev box: Ubuntu).
 
@@ -19,7 +20,9 @@ Owner: Aashique (machine: Genmitsu 4040 PRO MAX with Wi-Fi module; dev box: Ubun
    edits outside commands must call `History::checkpoint` first.
 4. **Anything that moves the machine or writes files on the AI's behalf must be
    `requires_confirmation: true`** in its `ToolSpec`. Never relax this.
-5. Core crates stay GUI-free and testable headless. Only `ezyx-app` depends on egui/eframe.
+5. Core crates stay GUI-free and testable headless. Only `ezyx-app` (and the thin `ezyx-mobile`
+   shell) depend on egui/eframe. Platform differences go in `ezyx-app/src/platform.rs`, not `cfg`s
+   scattered through the UI; file pickers go through `files::Files::{open,save}` (never `rfd` directly).
 6. No proprietary formats/assets copied. Vectric `.crv/.vtdb` import would need a clean-room spec.
 7. Tests next to code (`#[cfg(test)]`). New algorithms ship with at least one numeric test
    (areas/volumes/depths), not just "doesn't panic".
@@ -40,7 +43,8 @@ Owner: Aashique (machine: Genmitsu 4040 PRO MAX with Wi-Fi module; dev box: Ubun
 | ezyx-gpu | wgpu adapter probe, GPU family/tier classification, adapter choice + render budgets | `probe`, `classify`, `choose_adapter`, `render_budget` |
 | ezyx-ai | Anthropic/OpenAI/OpenAI-compatible providers, tool-use agent loop | `Agent::run_turn`, `ToolHost` |
 | ezyx-project | Project doc, Commands/History, **pipeline** (features timeline, auto-planner, conflicts, re-import merge), job sheet, **feature registry** (GUI tooltips + manual), demo project, machine profiles, op pipeline, AI tool host, SVG/DXF import, text | `pipeline::{plan_feature,replan,reimport,analyze}`, `registry::registry`, `ops::export_gcode` |
-| ezyx-app | egui/eframe GUI (binary `ez-yx-craft`): pipeline main window + module windows | `app.rs` (shell, actions, windows), `pipeline/*`, `image_studio.rs`, `solid/*`, `machine_control.rs`, `gpu_guard.rs`, `docshots.rs` |
+| ezyx-app | egui/eframe GUI (lib `ezyx_app` + desktop binary `ez-yx-craft`): pipeline main window + module windows | `lib.rs` (`run`, `run_desktop/android/ios`), `app.rs` (shell, actions, windows), `pipeline/*`, `image_studio.rs`, `solid/*`, `machine_control.rs`, `gpu_guard.rs`, `platform.rs`, `files.rs`, `docshots.rs` |
+| ezyx-mobile | iPad/Android entry points (cdylib + staticlib; empty on desktop). Shells in `mobile/android` (Gradle, NativeActivity) and `mobile/ios` (XcodeGen) | `android_main`, `ezyx_ios_main` |
 | ezyx-cli | headless CLI (binary `ezyx`) | `main.rs` subcommands |
 
 ## Commands
@@ -56,7 +60,13 @@ cargo run -p ezyx-cli -- docs-registry && python3 tools/docs/update_manual.py sc
 tools/docs/render_shots.sh                 # manual screenshots (xvfb; needs libxkbcommon-x11-0, mesa)
 python3 -m unittest discover tools/docs    # docs tooling tests
 EZYX_GPU_BACKEND=gl cargo run -p ezyx-app   # force OpenGL (old Radeon TeraScale etc.)
+cargo ndk -t arm64-v8a -P 26 check -p ezyx-mobile           # Android compile check (needs NDK + cargo-ndk)
+cargo check --target aarch64-apple-ios -p ezyx-mobile       # iPad compile check (macOS)
+gradle -p mobile/android assembleRelease                    # after cargo ndk … build → APK (docs/mobile.md)
+mobile/ios/build-rust.sh && xcodegen generate --spec mobile/ios/project.yml   # iPad Xcode project
 ```
+CI: `ci.yml` (tests + mobile cargo check), `release.yml` on `v*` tags (desktop installers + calls
+`mobile.yml`: APK/AAB + IPA). `mobile.yml` can be run by hand on any branch for test builds.
 Linux build deps for the GUI: `libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev` (see CI).
 Serial uses `serialport` with default features off (no libudev needed).
 
@@ -94,7 +104,9 @@ image pipelines, STL/OBJ/SVG/DXF IO, marching tets, tet meshing + VTK/Gmsh expor
 constrained sketches/parameters/holes/threads/sweep/loft, pipeline planner + conflicts + merge,
 Z-map simulation + material rendering, GPU classification + adapter choice/CPU-rendering fallback, AI agent loop (offline-tested), CLI,
 docs registry/scaffold/check + headless screenshots. GUI: pipeline stepper + 3 module windows
-(screenshot-verified under xvfb). Not yet verified on real hardware.
+(screenshot-verified under xvfb). iPad/Android: app compiles for aarch64-linux-android and
+aarch64-apple-ios (cargo check); APK/IPA packaging is defined in CI but not yet run on a real
+device. Not yet verified on real hardware.
 
 ## Known gaps / next steps (prioritised) — see docs/ROADMAP.md
 1. Verify the **Genmitsu Wi-Fi module protocol** on the owner's 4040 PRO MAX (capture traffic
@@ -133,5 +145,14 @@ docs registry/scaffold/check + headless screenshots. GUI: pipeline stepper + 3 m
 - GPU test hooks: `EZYX_RENDER=auto|gpu|cpu`, `EZYX_MAX_BUFFER_MB=8` (fake small GPU),
   `EZYX_FRAME_BUDGET=<tris>` (forces overflow → panic fallback), `EZYX_SIM_CELL=0.05` (huge sim).
   Software adapters (llvmpipe/lavapipe/WARP) are `DeviceType::Cpu`; xvfb runs exercise that path.
+- Mobile: no multi-viewport (modules are tabs, `Prefs::separate_windows` forced off), no process
+  spawning (`platform::CAN_SPAWN`; GPU fallback = crash marker + safe graphics next start), no
+  serial (`cfg(serial)` from `ezyx-machine/build.rs`), no `std::env::temp_dir` writes (Android's
+  is not writable), config/docs dirs from `platform::{config_dir,documents_dir}` (Android paths
+  come from `AndroidApp`). eframe features are per-target in `ezyx-app/Cargo.toml`: accesskit is
+  incompatible with NativeActivity, arboard/system fonts don't build on iOS.
+- Locally (no NDK/Xcode) the mobile targets can still be type-checked: point `CC_<target>` at clang
+  with `-ffreestanding -nostdinc` + stub `assert.h`/`string.h`/`TargetConditionals.h`, and a fake
+  `xcrun` for iOS (ring's C build only needs headers for `cargo check`).
 - GRBL "ok" accounting: manual lines and job lines share one queue; don't send manual lines
   while a job streams (UI disables run controls appropriately).

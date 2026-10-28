@@ -52,6 +52,8 @@ pub struct Dialogs {
     pub font_path: String,
     pub offset: f64,
     pub merge_report: Option<(String, bool)>,
+    /// A graphics setting changed this session (applies after a restart).
+    pub graphics_changed: bool,
 }
 
 /// Preferences persisted in the user's config dir.
@@ -66,11 +68,24 @@ pub struct Prefs {
     pub snap_objects: bool,
     /// Viewport rendering: best GPU, forced GPU, or CPU (software) rasteriser.
     pub render_mode: ezyx_gpu::RenderMode,
+    /// Graphics API (Vulkan / Metal / DX12 / OpenGL), `Auto` = best available.
+    pub gpu_backend: ezyx_gpu::GpuBackend,
+    /// Always start with halved preview budgets (after a GPU crash on a tablet, or by choice).
+    pub reduced_graphics: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { separate_windows: true, dark: false, snap_grid: true, grid: 0.5, snap_objects: true, render_mode: ezyx_gpu::RenderMode::Auto }
+        Self {
+            separate_windows: !crate::platform::MOBILE,
+            dark: false,
+            snap_grid: true,
+            grid: 0.5,
+            snap_objects: true,
+            render_mode: ezyx_gpu::RenderMode::Auto,
+            gpu_backend: ezyx_gpu::GpuBackend::Auto,
+            reduced_graphics: false,
+        }
     }
 }
 
@@ -86,10 +101,13 @@ pub struct GpuNotice {
 
 impl Prefs {
     fn path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("ezyx-craft").join("prefs.json"))
+        crate::platform::config_dir().map(|d| d.join("ezyx-craft").join("prefs.json"))
     }
     pub fn load() -> Self {
-        Self::path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+        let mut p: Self = Self::path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        // Tablets have one window: modules are always tabs.
+        p.separate_windows &= !crate::platform::MOBILE;
+        p
     }
     pub fn save(&self) {
         if let Some(p) = Self::path() {
@@ -135,6 +153,8 @@ pub struct EzApp {
     pub simplified: bool,
     /// Project revision and time of the last recovery autosave.
     autosaved: (u64, std::time::Instant),
+    /// Pending open/save requests (OS dialog on desktop, in-app browser on mobile).
+    pub files: crate::files::Files,
     pub draw: DrawState,
     pub dialogs: Dialogs,
     pub image: image_studio::Studio,
@@ -171,12 +191,14 @@ impl EzApp {
         let gpu = ezyx_gpu::best();
         // Budgets come from the device eframe actually created (see `gpu_guard::wgpu_options`).
         let mut graphics = gpu_guard::startup().unwrap_or_default();
+        let mut mobile_gpu = crate::platform::MOBILE;
         let (max_buffer, software, tier) = match &cc.wgpu_render_state {
             Some(rs) => {
                 gpu_guard::install(&rs.device);
                 let info = rs.adapter.get_info();
                 let software = graphics.software || info.device_type == eframe::wgpu::DeviceType::Cpu;
-                let vendor = if software { ezyx_gpu::Vendor::Software } else { ezyx_gpu::Vendor::from_pci(info.vendor) };
+                let vendor = if software { ezyx_gpu::Vendor::Software } else { ezyx_gpu::Vendor::detect(info.vendor, &info.name) };
+                mobile_gpu |= vendor.is_mobile();
                 let (_, mut tier, _) = ezyx_gpu::classify(vendor, &info.name);
                 if info.backend == eframe::wgpu::Backend::Gl {
                     tier = tier.min(ezyx_gpu::Tier::Legacy);
@@ -191,6 +213,14 @@ impl EzApp {
             None => (256 << 20, true, ezyx_gpu::Tier::None),
         };
         let mut budget = ezyx_gpu::render_budget(max_buffer, software, tier);
+        if mobile_gpu {
+            budget = budget.mobile();
+        }
+        // A graphics crash on the last run (tablets can't relaunch themselves, see gpu_guard).
+        let crashed = gpu_guard::previous_crash();
+        if prefs.reduced_graphics || crashed.is_some() {
+            budget = budget.reduced();
+        }
         let mut perf = ezyx_gpu::defaults_for(if software { ezyx_gpu::Tier::None } else { tier });
         // Testing / power-user overrides.
         if let Some(n) = std::env::var("EZYX_FRAME_BUDGET").ok().and_then(|v| v.parse::<usize>().ok()) {
@@ -208,10 +238,19 @@ impl EzApp {
             notice_lines.retain(|l| !l.starts_with("CPU rendering is selected"));
             notice_lines.insert(0, format!("The GPU renderer failed ({e}), so EZ-YX-craft restarted with CPU rendering and reopened your work."));
         }
+        if let Some((e, _)) = &crashed {
+            notice_lines.insert(
+                0,
+                format!(
+                    "The graphics driver crashed last time ({e}). EZ-YX-craft started with simplified previews{} and reopened your work.",
+                    if cfg!(target_os = "android") && graphics.backend == "Gl" { " on OpenGL ES" } else { "" }
+                ),
+            );
+        }
         let gpu_notice = (!notice_lines.is_empty()).then(|| GpuNotice {
             title: "Graphics".into(),
             lines: notice_lines,
-            offer_cpu: !software && graphics.mode != ezyx_gpu::RenderMode::Gpu,
+            offer_cpu: (!software && graphics.mode != ezyx_gpu::RenderMode::Gpu) || (crate::platform::MOBILE && !prefs.reduced_graphics),
             remember: false,
         });
         let docs = docshots::DocShots::from_env();
@@ -247,6 +286,7 @@ impl EzApp {
             gpu_notice,
             simplified: false,
             autosaved: (0, std::time::Instant::now()),
+            files: Default::default(),
             draw: DrawState::default(),
             dialogs: Dialogs {
                 about: false,
@@ -257,6 +297,7 @@ impl EzApp {
                 font_path: String::new(),
                 offset: 3.0,
                 merge_report: None,
+                graphics_changed: false,
             },
             image: Default::default(),
             solid: Default::default(),
@@ -283,6 +324,8 @@ impl EzApp {
         // Open a project passed on the command line (also used by OS file associations).
         if let Some(path) = std::env::args().nth(1).filter(|a| !a.starts_with('-')).map(PathBuf::from) {
             app.load_project(&path);
+        } else if let Some((_, Some(recovery))) = crashed {
+            app.load_project(&recovery);
         }
         // `EZYX_OPEN_MODULES=image,solid,machine` opens module windows at start (testing / kiosks).
         for m in std::env::var("EZYX_OPEN_MODULES").unwrap_or_default().split(',') {
@@ -296,6 +339,8 @@ impl EzApp {
         if !app.open.is_empty() {
             app.tile_in = 20;
         }
+        // Try the tablets' in-app file browser on the desktop.
+        app.files.force_in_app |= std::env::var_os("EZYX_INAPP_FILES").is_some();
         app.fit_view();
         app
     }
@@ -375,24 +420,20 @@ impl EzApp {
         self.fit_view();
     }
 
-    fn file_dialog() -> rfd::FileDialog {
-        rfd::FileDialog::new()
+    pub fn save(&mut self, as_new: bool) {
+        match self.path.clone() {
+            Some(p) if !as_new => self.save_to(p),
+            _ => self.files.save("EZ-YX-craft project", &["ezyx"], format!("{}.ezyx", self.project.name), |app, p| app.save_to(p)),
+        }
     }
 
-    pub fn save(&mut self, as_new: bool) {
-        let path = if as_new || self.path.is_none() {
-            Self::file_dialog().add_filter("EZ-YX-craft project", &["ezyx"]).set_file_name(format!("{}.ezyx", self.project.name)).save_file()
-        } else {
-            self.path.clone()
-        };
-        if let Some(p) = path {
-            match self.project.save(&p) {
-                Ok(()) => {
-                    self.status = format!("Saved {}", p.display());
-                    self.path = Some(p);
-                }
-                Err(e) => self.status = format!("⚠ save failed: {e}"),
+    fn save_to(&mut self, p: PathBuf) {
+        match self.project.save(&p) {
+            Ok(()) => {
+                self.status = format!("Saved {}", p.display());
+                self.path = Some(p);
             }
+            Err(e) => self.status = format!("⚠ save failed: {e}"),
         }
     }
 
@@ -611,7 +652,7 @@ impl EzApp {
         if lines.is_empty() {
             return;
         }
-        let offer_cpu = !self.graphics.software;
+        let offer_cpu = !self.graphics.software && !(crate::platform::MOBILE && self.prefs.reduced_graphics);
         let n = self.gpu_notice.get_or_insert_with(|| GpuNotice {
             title: "Graphics problem — EZ-YX-craft kept running".into(),
             lines: vec![],
@@ -627,11 +668,25 @@ impl EzApp {
 
     /// Copy of the current project in the config dir (used before restarting the renderer).
     pub fn save_recovery(&self) -> Result<PathBuf, String> {
-        let dir = dirs::config_dir().ok_or("no config directory")?.join("ezyx-craft");
+        let dir = crate::platform::config_dir().ok_or("no config directory")?.join("ezyx-craft");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let p = dir.join("recovery.ezyx");
         self.project.save(&p).map_err(|e| e.to_string())?;
         Ok(p)
+    }
+
+    /// Tablets: no software renderer and no relaunch — remember simplified previews (and OpenGL ES
+    /// on Android) for the next start instead.
+    pub fn use_safe_graphics(&mut self) {
+        self.prefs.reduced_graphics = true;
+        if cfg!(target_os = "android") {
+            self.prefs.gpu_backend = ezyx_gpu::GpuBackend::Gl;
+        }
+        self.prefs.save();
+        if let Ok(p) = self.save_recovery() {
+            gpu_guard::set_recovery_path(p);
+        }
+        self.status = "Safe graphics will be used from the next start — close and reopen EZ-YX-craft to apply it now.".into();
     }
 
     /// Restart the app with another renderer, reopening the current project.
@@ -760,23 +815,11 @@ impl EzApp {
                 self.fit_view();
                 self.status = "New project — choose your stock.".into();
             }
-            Action::Open => {
-                if let Some(p) = Self::file_dialog().add_filter("EZ-YX-craft project", &["ezyx"]).pick_file() {
-                    self.load_project(&p);
-                }
-            }
+            Action::Open => self.files.open("EZ-YX-craft project", &["ezyx"], |app, p| app.load_project(&p)),
             Action::Save => self.save(false),
             Action::SaveAs => self.save(true),
-            Action::ImportVectors => {
-                if let Some(p) = Self::file_dialog().add_filter("Vectors", &["svg", "dxf"]).pick_file() {
-                    self.import_vectors(&p);
-                }
-            }
-            Action::ImportMesh => {
-                if let Some(p) = Self::file_dialog().add_filter("3D model", &["stl", "obj"]).pick_file() {
-                    self.import_mesh(&p);
-                }
-            }
+            Action::ImportVectors => self.files.open("vectors (SVG/DXF)", &["svg", "dxf"], |app, p| app.import_vectors(&p)),
+            Action::ImportMesh => self.files.open("3D model (STL/OBJ)", &["stl", "obj"], |app, p| app.import_mesh(&p)),
             Action::Undo => {
                 if self.history.undo(&mut self.project) {
                     self.touch();
@@ -1030,22 +1073,17 @@ impl EzApp {
         match ezyx_project::ops::export_gcode(&self.project, &self.library) {
             Ok((g, warnings)) => {
                 let ext = ezyx_gcode::post::find_post(&self.project.post_id).map(|p| p.extension).unwrap_or_else(|| "nc".into());
-                if let Some(path) = Self::file_dialog()
-                    .add_filter("G-code", &[ext.as_str(), "nc", "gcode", "tap", "ngc"])
-                    .set_file_name(format!("{}.{ext}", self.project.name))
-                    .save_file()
-                {
-                    match std::fs::write(&path, g) {
-                        Ok(()) => {
-                            self.status = format!(
-                                "G-code saved to {}{}",
-                                path.display(),
-                                if warnings.is_empty() { String::new() } else { format!(" — ⚠ {}", warnings.join("; ")) }
-                            )
-                        }
-                        Err(e) => self.status = format!("⚠ {e}"),
+                let name = format!("{}.{ext}", self.project.name);
+                self.files.save("G-code", &[ext.as_str(), "nc", "gcode", "tap", "ngc"], name, move |app, path| match std::fs::write(&path, g) {
+                    Ok(()) => {
+                        app.status = format!(
+                            "G-code saved to {}{}",
+                            path.display(),
+                            if warnings.is_empty() { String::new() } else { format!(" — ⚠ {}", warnings.join("; ")) }
+                        )
                     }
-                }
+                    Err(e) => app.status = format!("⚠ {e}"),
+                });
             }
             Err(e) => self.status = format!("⚠ {e}"),
         }
@@ -1054,12 +1092,12 @@ impl EzApp {
     pub fn export_job_sheet(&mut self) {
         let s = ezyx_project::jobsheet::summarize(&self.project, &self.library, &self.results);
         let html = ezyx_project::jobsheet::html(&self.project, &s, &self.conflicts);
-        if let Some(path) = Self::file_dialog().add_filter("HTML", &["html"]).set_file_name(format!("{} job sheet.html", self.project.name)).save_file() {
-            self.status = match std::fs::write(&path, html) {
+        self.files.save("job sheet (HTML)", &["html"], format!("{} job sheet.html", self.project.name), move |app, path| {
+            app.status = match std::fs::write(&path, html) {
                 Ok(()) => format!("Job sheet saved to {}", path.display()),
                 Err(e) => format!("⚠ {e}"),
             };
-        }
+        });
     }
 
     pub fn send_to_machine(&mut self) {
@@ -1224,7 +1262,12 @@ impl EzApp {
                         .color(theme::STEEL),
                     );
                     ui.horizontal(|ui| {
-                        if n.offer_cpu {
+                        if n.offer_cpu && crate::platform::MOBILE {
+                            if ui.button(RichText::new("Use safe graphics").strong()).on_hover_text(ribbon::tip("settings.graphics")).clicked() {
+                                restart = true;
+                                keep = false;
+                            }
+                        } else if n.offer_cpu {
                             if ui.button(RichText::new("Restart with CPU rendering").strong()).on_hover_text(ribbon::tip("settings.graphics")).clicked() {
                                 restart = true;
                             }
@@ -1236,7 +1279,9 @@ impl EzApp {
                     });
                 },
             );
-            if restart {
+            if restart && crate::platform::MOBILE {
+                self.use_safe_graphics();
+            } else if restart {
                 self.restart_renderer(ezyx_gpu::RenderMode::Cpu, n.remember, ctx);
             }
             self.gpu_notice = keep.then_some(n);
@@ -1281,31 +1326,52 @@ impl EzApp {
                     .small()
                     .color(theme::STEEL),
                 );
-                let before = self.prefs.render_mode;
-                ui.horizontal(|ui| {
-                    ui.label("Render with");
-                    ui.radio_value(&mut self.prefs.render_mode, ezyx_gpu::RenderMode::Auto, "Auto")
-                        .on_hover_text("Best compatible GPU; CPU only if no GPU is usable");
-                    ui.radio_value(&mut self.prefs.render_mode, ezyx_gpu::RenderMode::Gpu, "GPU")
-                        .on_hover_text("Always the GPU, even one below the recommended limits");
-                    ui.radio_value(&mut self.prefs.render_mode, ezyx_gpu::RenderMode::Cpu, "CPU")
-                        .on_hover_text("Software renderer: slower, but works with any driver");
-                });
-                if self.prefs.render_mode != before {
-                    changed = true;
-                }
-                if self.prefs.render_mode != self.graphics.mode {
+                let before = (self.prefs.render_mode, self.prefs.gpu_backend, self.prefs.reduced_graphics);
+                if !crate::platform::MOBILE {
+                    // Tablets have no software renderer to fall back to.
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Takes effect after a restart.").small().color(theme::WARN));
-                        if ui.small_button("Restart now").clicked() {
-                            restart = Some(self.prefs.render_mode);
+                        ui.label("Render with");
+                        ui.radio_value(&mut self.prefs.render_mode, ezyx_gpu::RenderMode::Auto, "Auto")
+                            .on_hover_text("Best compatible GPU; CPU only if no GPU is usable");
+                        ui.radio_value(&mut self.prefs.render_mode, ezyx_gpu::RenderMode::Gpu, "GPU")
+                            .on_hover_text("Always the GPU, even one below the recommended limits");
+                        ui.radio_value(&mut self.prefs.render_mode, ezyx_gpu::RenderMode::Cpu, "CPU")
+                            .on_hover_text("Software renderer: slower, but works with any driver");
+                    });
+                }
+                if ezyx_gpu::GpuBackend::choices().len() > 2 {
+                    ui.horizontal(|ui| {
+                        ui.label("Graphics API");
+                        for b in ezyx_gpu::GpuBackend::choices() {
+                            ui.radio_value(&mut self.prefs.gpu_backend, *b, b.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text("Auto picks the best. OpenGL is the compatibility choice when the 3D view glitches or crashes.");
+                }
+                ui.checkbox(&mut self.prefs.reduced_graphics, "Simplified previews (half the GPU memory)");
+                if (self.prefs.render_mode, self.prefs.gpu_backend, self.prefs.reduced_graphics) != before {
+                    changed = true;
+                    self.dialogs.graphics_changed = true;
+                }
+                if self.dialogs.graphics_changed {
+                    ui.horizontal(|ui| {
+                        if crate::platform::CAN_SPAWN {
+                            ui.label(RichText::new("Takes effect after a restart.").small().color(theme::WARN));
+                            if ui.small_button("Restart now").clicked() {
+                                restart = Some(self.prefs.render_mode);
+                            }
+                        } else {
+                            ui.label(RichText::new("Takes effect the next time you open EZ-YX-craft.").small().color(theme::WARN));
                         }
                     });
                 }
-                ui.separator();
-                ui.label(RichText::new("Windows").strong());
-                changed |= ui.radio_value(&mut self.prefs.separate_windows, true, "Open modules in separate windows (side by side)").changed();
-                changed |= ui.radio_value(&mut self.prefs.separate_windows, false, "Show modules as tabs inside the main window").changed();
+                if !crate::platform::MOBILE {
+                    ui.separator();
+                    ui.label(RichText::new("Windows").strong());
+                    changed |= ui.radio_value(&mut self.prefs.separate_windows, true, "Open modules in separate windows (side by side)").changed();
+                    changed |= ui.radio_value(&mut self.prefs.separate_windows, false, "Show modules as tabs inside the main window").changed();
+                }
                 ui.separator();
                 ui.label(RichText::new("Drawing").strong());
                 changed |= ui.checkbox(&mut self.prefs.snap_grid, "Snap to grid").changed();
@@ -1342,9 +1408,7 @@ impl EzApp {
                     ui.label("Font file (optional):");
                     ui.text_edit_singleline(&mut self.dialogs.font_path);
                     if ui.button("…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().add_filter("Fonts", &["ttf", "otf"]).pick_file() {
-                            self.dialogs.font_path = p.display().to_string();
-                        }
+                        self.files.open("font", &["ttf", "otf"], |app, p| app.dialogs.font_path = p.display().to_string());
                     }
                 });
                 if ui.button(RichText::new("Add").strong()).clicked() {
@@ -1504,6 +1568,7 @@ impl eframe::App for EzApp {
         for a in actions {
             self.handle(a, &ctx);
         }
+        crate::files::process(self, &ctx);
         if self.tasks.running > 0 || self.machine.connected() || self.ai.busy || self.docs.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }

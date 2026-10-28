@@ -36,6 +36,15 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
         s.spacing.button_padding = egui::vec2(8.0, 4.0);
+        if crate::platform::MOBILE {
+            // Finger-sized targets on tablets.
+            s.spacing.button_padding = egui::vec2(12.0, 8.0);
+            s.spacing.interact_size = egui::vec2(48.0, 34.0);
+            s.spacing.icon_width = 22.0;
+            s.spacing.icon_width_inner = 12.0;
+            s.spacing.slider_width = 160.0;
+            s.spacing.scroll.bar_width = 12.0;
+        }
     });
 }
 

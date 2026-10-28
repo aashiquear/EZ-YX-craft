@@ -951,9 +951,9 @@
       "title": "Graphics: GPU checks and CPU fallback",
       "summary": "At start-up EZ-YX-craft checks the graphics adapters. GPUs that can't run the viewport (no driver, tiny buffer or texture limits, can't draw to the window) are skipped, and if none is usable the app renders on the CPU instead and tells you why. While you work, previews are sized to the GPU's buffer limit; if the GPU still runs out of memory the app simplifies the view and offers to restart with CPU rendering instead of crashing.",
       "how_to": [
-        "If a ⚠ Graphics message appears, read why and choose Restart with CPU rendering or OK.",
+        "If a ⚠ Graphics message appears, read why and choose Restart with CPU rendering (Use safe graphics on a tablet) or OK.",
         "File › ⚙ Settings › Graphics shows the adapter in use and its limits.",
-        "Choose Render with Auto, GPU or CPU and click Restart now (or start with EZYX_RENDER=cpu)."
+        "Choose Render with Auto, GPU or CPU, the Graphics API, or Simplified previews, then click Restart now (or start with EZYX_RENDER=cpu)."
       ],
       "since": "0.2.0",
       "shots": [],
@@ -965,7 +965,36 @@
         "cpu rendering",
         "software",
         "out of memory",
-        "crash"
+        "crash",
+        "vulkan",
+        "opengl",
+        "metal"
+      ]
+    },
+    {
+      "id": "settings.tablets",
+      "module": "settings",
+      "title": "iPad and Android tablets",
+      "summary": "The same app runs on iPad and Android tablets: modules open as tabs, one finger draws and orbits, two fingers pan, pinch and turn the view. Files live in the app's own folder, and the machine is reached over Wi-Fi (tablets can't open USB serial ports).",
+      "how_to": [
+        "Install the iPad IPA or the Android APK from the release page (or TestFlight / Google Play when published).",
+        "Copy projects, SVG/DXF, images and G-code into the app's folder: Files app › On My iPad › EZ-YX-craft, or Android/data/org.ezyxcraft.app/files.",
+        "Open and save from the in-app file browser; connect to the machine with 📶 Wi-Fi TCP or WebSocket in Machine Control."
+      ],
+      "since": "0.2.0",
+      "shots": [
+        "tablet_files"
+      ],
+      "chapter": "settings.md",
+      "keywords": [
+        "ipad",
+        "android",
+        "tablet",
+        "mobile",
+        "touch",
+        "gestures",
+        "files app",
+        "wi-fi"
       ]
     },
     {
@@ -1103,6 +1132,20 @@
         "connect_sim"
       ],
       "caption": "Machine Control connected to the simulator",
+      "size": [
+        1480,
+        920
+      ]
+    },
+    {
+      "id": "tablet_files",
+      "workspace": "pipeline",
+      "step": "design",
+      "project": "",
+      "setup": [
+        "file_browser:examples"
+      ],
+      "caption": "The in-app file browser used on iPad and Android",
       "size": [
         1480,
         920

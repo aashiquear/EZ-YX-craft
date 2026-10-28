@@ -86,7 +86,8 @@ impl MachineJob {
 impl Default for MachineState {
     fn default() -> Self {
         Self {
-            link: Link::Usb,
+            // Tablets reach the machine over Wi-Fi only.
+            link: if crate::platform::USB_SERIAL { Link::Usb } else { Link::WifiTcp },
             ports: vec![],
             port: String::new(),
             baud: 115_200,
@@ -207,7 +208,9 @@ pub fn connection(app: &mut EzApp, ui: &mut Ui) -> bool {
     ui.label(RichText::new(&app.project.machine.connection_hint).small().color(theme::STEEL));
     if m.controller.is_none() {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut m.link, Link::Usb, "🔌 USB");
+            if crate::platform::USB_SERIAL {
+                ui.selectable_value(&mut m.link, Link::Usb, "🔌 USB");
+            }
             ui.selectable_value(&mut m.link, Link::WifiTcp, "📶 Wi-Fi TCP");
             ui.selectable_value(&mut m.link, Link::WifiWs, "📶 WebSocket");
             ui.selectable_value(&mut m.link, Link::Simulator, "🧪 Simulator");
