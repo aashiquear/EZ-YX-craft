@@ -30,7 +30,7 @@ pub struct AiState {
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {
-    dirs::config_dir().map(|d| d.join("ez-yx-craft").join("assistant.json"))
+    crate::platform::config_dir().map(|d| d.join("ez-yx-craft").join("assistant.json"))
 }
 
 impl AiState {

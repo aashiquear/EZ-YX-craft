@@ -2,7 +2,6 @@ pub mod ai;
 pub mod image;
 pub mod inspector;
 pub mod machine;
-pub mod tree;
 
 /// Length field shown in the job's display units but stored in mm.
 pub fn len_field(ui: &mut egui::Ui, mm: &mut f64, units: ezyx_core::Units, range: std::ops::RangeInclusive<f64>) -> egui::Response {

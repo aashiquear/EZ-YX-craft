@@ -47,7 +47,42 @@ impl Kernel {
     }
 }
 
+/// Bytes per Z-map cell (height f32 + "cut" flag) — for memory budgeting.
+pub const BYTES_PER_CELL: usize = 5;
+
+/// The cell size to use for `job` so the Z-map stays under `max_cells` cells: `cell` itself when
+/// it fits, otherwise the smallest coarser cell that does (rounded up to 0.01 mm).
+pub fn cell_for_budget(job: &JobSetup, cell: f64, max_cells: usize) -> f64 {
+    let cells = |c: f64| (job.width / c).ceil() * (job.height / c).ceil();
+    if cells(cell) <= max_cells as f64 {
+        return cell;
+    }
+    let mut c = (job.width * job.height / max_cells.max(1) as f64).sqrt();
+    c = (c * 100.0).ceil() / 100.0;
+    while cells(c) > max_cells as f64 {
+        c += 0.01;
+    }
+    c.max(cell)
+}
+
 impl StockSim {
+    /// Triangles [`Self::render_mesh`] produces at `lod` (top, bottom and side walls).
+    pub fn render_triangles(&self, lod: usize) -> usize {
+        let step = lod.max(1);
+        let n = |len: usize| (len - 1).div_ceil(step) + 1;
+        let (nx, ny) = (n(self.hm.width), n(self.hm.height));
+        4 * (nx - 1) * (ny - 1) + 4 * (nx - 1) + 4 * (ny - 1)
+    }
+
+    /// Smallest display step (≥ `min_lod`) whose render mesh has at most `max_tris` triangles.
+    pub fn lod_for_budget(&self, max_tris: usize, min_lod: usize) -> usize {
+        let mut lod = min_lod.max(1);
+        while self.render_triangles(lod) > max_tris && lod < self.hm.width.max(self.hm.height) {
+            lod += 1;
+        }
+        lod
+    }
+
     /// Flat stock from the job (top at Z = 0) at resolution `cell` mm.
     pub fn new(job: &JobSetup, cell: f64) -> Self {
         let hm = Heightmap::covering(DVec2::ZERO, DVec2::new(job.width, job.height), cell, 0.0);
@@ -241,6 +276,24 @@ pub fn advise(tp: &Toolpath, group: MaterialGroup, machine: &MachineLimits) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budgets_bound_memory_and_triangles() {
+        let job = JobSetup { width: 1200.0, height: 600.0, thickness: 18.0, ..Default::default() };
+        // 0.05 mm on a 1200 × 600 board would be 288 M cells (1.4 GB); cap at 20 M cells.
+        let c = cell_for_budget(&job, 0.05, 20_000_000);
+        let cells = (1200.0 / c).ceil() * (600.0 / c).ceil();
+        assert!(cells <= 2.0e7 && cells > 1.9e7, "{c} → {cells}");
+        assert_eq!(cell_for_budget(&job, 1.0, 20_000_000), 1.0);
+        // Render mesh triangle count is exact and the budget LOD respects it.
+        let sim = StockSim::new(&JobSetup { width: 100.0, height: 50.0, ..Default::default() }, 0.1);
+        let mat = ezyx_materials::library()[0].clone();
+        for lod in [1, 3, 7] {
+            assert_eq!(sim.render_mesh(&mat, lod).indices.len(), sim.render_triangles(lod));
+        }
+        let lod = sim.lod_for_budget(100_000, 1);
+        assert!(sim.render_triangles(lod) <= 100_000 && sim.render_triangles(lod - 1) > 100_000, "lod {lod}");
+    }
     use ezyx_cam::{ops::pocket, CutDirection, CutParams};
     use ezyx_core::path::shapes::rectangle;
     use ezyx_tooldb::{Operation, ToolLibrary};

@@ -1,0 +1,21 @@
+[package]
+name = "ezyx-mobile"
+description = "EZ-YX-craft for iPad (staticlib linked by the Xcode shell) and Android (cdylib loaded by NativeActivity)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "ezyx_mobile"
+# cdylib → libezyx_mobile.so for Android, staticlib → libezyx_mobile.a for the iOS app.
+crate-type = ["cdylib", "staticlib"]
+
+# On desktop this crate is empty (so `cargo test --workspace` stays cheap).
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+ezyx-app = { path = "../ezyx-app" }
+log.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"

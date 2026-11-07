@@ -4,8 +4,17 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 
 pub enum TaskResult {
     Toolpaths(Vec<ezyx_project::ops::OpResult>),
-    Simulation { mesh: ezyx_mesh::TriMesh, removed_cm3: f64, warnings: Vec<String>, seconds: f64 },
-    PartMesh { id: u64, mesh: ezyx_mesh::TriMesh },
+    Simulation {
+        mesh: ezyx_mesh::TriMesh,
+        removed_cm3: f64,
+        warnings: Vec<String>,
+        seconds: f64,
+        final_render: bool,
+    },
+    /// Solid Modeler background work (part meshing, mass properties).
+    Solid(crate::solid::SolidResult),
+    /// Image Studio background work (live conversion previews).
+    Studio(crate::image_studio::StudioResult),
     Error(String),
 }
 

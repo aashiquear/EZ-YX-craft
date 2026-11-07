@@ -3,7 +3,7 @@
 //!
 //! Rendering note: v0.1 projects geometry on the CPU and paints it through egui (works on every
 //! backend incl. OpenGL-only TeraScale GPUs). Triangles are depth-sorted (painter's algorithm)
-//! with back-face culling. The planned upgrade is an `egui_wgpu` paint callback with a real depth
+//! with back-face culling, inside the per-frame triangle budget of `gpu_guard`. The planned upgrade is an `egui_wgpu` paint callback with a real depth
 //! buffer and GPU-resident meshes — the `Projector`/`Camera` API stays the same.
 
 use egui::{epaint::Mesh, Color32, Painter, Pos2, Rect, Response, Shape, Stroke, Ui};
@@ -159,9 +159,27 @@ impl Projector {
 /// Navigation. Returns true when the camera changed.
 /// * 3D: LMB-drag orbit (unless `lmb_reserved`), RMB/MMB or Shift+LMB pan, wheel/pinch zoom to cursor.
 /// * 2D: LMB is reserved for selection/drawing; RMB/MMB pan, wheel zoom.
+/// * Touch (tablets, touch screens): one finger acts as LMB, two fingers pan + pinch-zoom, and
+///   twisting two fingers turns the 3D view.
 pub fn navigate(ui: &Ui, resp: &Response, cam: &mut Camera, rect: Rect, lmb_reserved: bool) -> bool {
     let mut changed = false;
     let shift = ui.input(|i| i.modifiers.shift);
+    if let Some(t) = ui.input(|i| i.multi_touch()).filter(|t| rect.contains(t.center_pos)) {
+        // Two fingers: pan with the centre, turn with the twist (zoom comes through zoom_delta).
+        let pr = Projector::new(cam, rect);
+        let z = cam.target.z;
+        if let (Some(a), Some(b)) = (pr.ground(t.center_pos - t.translation_delta, z), pr.ground(t.center_pos, z)) {
+            cam.target -= b - a;
+        }
+        if !cam.ortho_locked_2d() {
+            cam.yaw -= t.rotation_delta;
+        }
+        let factor = 1.0 / t.zoom_delta.max(1e-3);
+        if (factor - 1.0).abs() > 1e-5 {
+            cam.dist = (cam.dist * factor).clamp(1.0, 50_000.0);
+        }
+        return true;
+    }
     let pan_drag = resp.dragged_by(egui::PointerButton::Secondary)
         || resp.dragged_by(egui::PointerButton::Middle)
         || (shift && resp.dragged_by(egui::PointerButton::Primary));
@@ -223,7 +241,14 @@ pub struct Draw<'a> {
 }
 
 impl Draw<'_> {
+    /// Line segment inside this window's GPU vertex budget (silently skipped when it's used up).
     pub fn line(&self, a: Vec3, b: Vec3, stroke: Stroke) {
+        if crate::gpu_guard::take_segments(self.painter.ctx(), 1) == 1 {
+            self.line_reserved(a, b, stroke);
+        }
+    }
+    /// Line segment whose budget the caller already reserved in bulk (`gpu_guard::take_segments`).
+    pub fn line_reserved(&self, a: Vec3, b: Vec3, stroke: Stroke) {
         if let (Some(p), Some(q)) = (self.pr.to_screen(a), self.pr.to_screen(b)) {
             self.painter.line_segment([p, q], stroke);
         }
@@ -236,11 +261,27 @@ impl Draw<'_> {
         if closed {
             s.push(s[0]);
         }
+        // Over budget: keep an even subset of the points (the shape stays recognisable).
+        let granted = crate::gpu_guard::take_segments(self.painter.ctx(), s.len());
+        if granted < s.len() {
+            if granted < 2 {
+                return;
+            }
+            let step = s.len() as f64 / granted as f64;
+            let last = *s.last().unwrap();
+            s = (0..granted).map(|k| s[(k as f64 * step) as usize]).chain(std::iter::once(last)).collect();
+        }
         self.painter.add(Shape::line(s, stroke));
     }
-    pub fn dashed(&self, a: Vec3, b: Vec3, stroke: Stroke) {
+    /// Dashed segment whose budget the caller already reserved.
+    pub fn dashed_reserved(&self, a: Vec3, b: Vec3, stroke: Stroke) {
         if let (Some(p), Some(q)) = (self.pr.to_screen(a), self.pr.to_screen(b)) {
-            self.painter.extend(Shape::dashed_line(&[p, q], stroke, 4.0, 4.0));
+            // Dashes multiply the segment count: plain thin line when it's long on screen.
+            if (q - p).length() > 400.0 {
+                self.painter.line_segment([p, q], Stroke::new(stroke.width * 0.6, stroke.color.gamma_multiply(0.6)));
+            } else {
+                self.painter.extend(Shape::dashed_line(&[p, q], stroke, 4.0, 4.0));
+            }
         }
     }
 
@@ -275,6 +316,17 @@ impl Draw<'_> {
             let to8 = |v: f32| (v * light * 255.0).clamp(0.0, 255.0) as u8;
             let color = Color32::from_rgba_unmultiplied(to8(col[0]), to8(col[1]), to8(col[2]), alpha);
             tris.push(((a.1 + b.1 + c.1) / 3.0, [a.0, b.0, c.0], color));
+        }
+        // Stay inside this window's per-frame GPU buffer budget: if the visible triangles don't
+        // fit, keep an even subset (the caller should hand us an already-decimated mesh; this is
+        // the last line of defence against an over-size vertex buffer).
+        let granted = crate::gpu_guard::take_triangles(self.painter.ctx(), tris.len());
+        if granted < tris.len() {
+            if granted == 0 {
+                return;
+            }
+            let step = tris.len() as f64 / granted as f64;
+            tris = (0..granted).map(|k| tris[(k as f64 * step) as usize]).collect();
         }
         tris.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
         // Chunk into several meshes to keep each under u16-friendly sizes for older backends.

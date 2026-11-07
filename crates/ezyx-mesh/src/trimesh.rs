@@ -129,6 +129,84 @@ impl TriMesh {
         }
     }
 
+    /// Bytes this mesh occupies once tessellated for display (3 unshared 20-byte egui vertices and
+    /// three u32 indices per triangle) — what a GPU vertex/index buffer has to hold.
+    pub fn display_bytes(&self) -> usize {
+        self.indices.len() * (3 * 20 + 3 * 4)
+    }
+
+    /// Simplify to at most `max_tris` triangles by vertex clustering on a uniform grid: vertices in
+    /// the same cell merge into their average (colours averaged too), collapsed and duplicate
+    /// triangles are dropped. Fast and robust (no topology requirements) — used to keep viewport
+    /// meshes inside the GPU's buffer limits. Returns a clone when already small enough.
+    pub fn decimated(&self, max_tris: usize) -> TriMesh {
+        if self.indices.len() <= max_tris || self.positions.is_empty() {
+            return self.clone();
+        }
+        let (lo, hi) = self.bounds();
+        let size = (hi - lo).max(Vec3::splat(1e-6));
+        // A surface of area A clustered with cell c has roughly 2·A/c² triangles; start there and
+        // grow the cell until the target is met.
+        let area: f32 = (0..self.indices.len())
+            .map(|i| {
+                let [a, b, c] = self.triangle(i);
+                (b - a).cross(c - a).length() * 0.5
+            })
+            .sum();
+        let mut cell = (2.0 * area.max(1e-9) / max_tris.max(1) as f32).sqrt().max(size.max_element() * 1e-4);
+        let has_col = self.colors.len() == self.positions.len();
+        for _ in 0..40 {
+            let dims = (size / cell).ceil().as_uvec3() + 1;
+            let key = |p: Vec3| {
+                let g = ((p - lo) / cell).floor().as_uvec3().min(dims - 1);
+                (g.z as u64 * dims.y as u64 + g.y as u64) * dims.x as u64 + g.x as u64
+            };
+            let mut cluster: HashMap<u64, u32> = HashMap::new();
+            let mut sum: Vec<(Vec3, [f32; 3], u32)> = Vec::new();
+            let remap: Vec<u32> = self
+                .positions
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let id = *cluster.entry(key(*p)).or_insert_with(|| {
+                        sum.push((Vec3::ZERO, [0.0; 3], 0));
+                        (sum.len() - 1) as u32
+                    });
+                    let e = &mut sum[id as usize];
+                    e.0 += *p;
+                    if has_col {
+                        for k in 0..3 {
+                            e.1[k] += self.colors[i][k];
+                        }
+                    }
+                    e.2 += 1;
+                    id
+                })
+                .collect();
+            let mut seen = std::collections::HashSet::new();
+            let indices: Vec<[u32; 3]> = self
+                .indices
+                .iter()
+                .map(|t| [remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]])
+                .filter(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2])
+                .filter(|t| {
+                    // Same triangle in either winding counts once per winding (keeps both sides of thin walls).
+                    let r = t.iter().position(|v| *v == *t.iter().min().unwrap()).unwrap();
+                    seen.insert([t[r], t[(r + 1) % 3], t[(r + 2) % 3]])
+                })
+                .collect();
+            if indices.len() <= max_tris {
+                let positions = sum.iter().map(|(p, _, n)| *p / *n as f32).collect();
+                let colors = if has_col { sum.iter().map(|(_, c, n)| c.map(|v| v / *n as f32)).collect() } else { vec![] };
+                return TriMesh { positions, indices, colors };
+            }
+            cell *= 1.3;
+        }
+        // Pathological input: fall back to keeping every k-th triangle.
+        let k = self.indices.len().div_ceil(max_tris.max(1));
+        TriMesh { positions: self.positions.clone(), indices: self.indices.iter().step_by(k).copied().collect(), colors: self.colors.clone() }
+    }
+
     pub fn cube(min: Vec3, max: Vec3) -> TriMesh {
         let p = |x: bool, y: bool, z: bool| Vec3::new(if x { max.x } else { min.x }, if y { max.y } else { min.y }, if z { max.z } else { min.z });
         let positions = vec![
@@ -154,5 +232,45 @@ mod tests {
         let c = TriMesh::cube(Vec3::ZERO, Vec3::new(2.0, 3.0, 4.0));
         assert!((c.volume() - 24.0).abs() < 1e-4);
         assert_eq!(c.boundary_edge_count(), 0);
+    }
+
+    #[test]
+    fn decimation_hits_budget_and_keeps_shape() {
+        // 200×100 grid surface (40 000 triangles) of a 100 × 50 mm sheet with a ramp.
+        let (nx, ny) = (201u32, 101u32);
+        let mut m = TriMesh::default();
+        for j in 0..ny {
+            for i in 0..nx {
+                m.positions.push(Vec3::new(i as f32 * 0.5, j as f32 * 0.5, i as f32 * 0.01));
+                m.colors.push([0.5, 0.25, 0.1]);
+            }
+        }
+        for j in 0..ny - 1 {
+            for i in 0..nx - 1 {
+                let a = j * nx + i;
+                m.indices.push([a, a + 1, a + nx + 1]);
+                m.indices.push([a, a + nx + 1, a + nx]);
+            }
+        }
+        assert_eq!(m.indices.len(), 40_000);
+        let d = m.decimated(2_000);
+        assert!(d.indices.len() <= 2_000 && d.indices.len() > 500, "{}", d.indices.len());
+        // Bounds shrink by at most one cluster cell and the projected area is kept within 10 %.
+        let (lo, hi) = d.bounds();
+        assert!(lo.x < 3.0 && hi.x > 97.0 && lo.y < 3.0 && hi.y > 47.0, "{lo:?} {hi:?}");
+        let area: f32 = (0..d.indices.len())
+            .map(|i| {
+                let [a, b, c] = d.triangle(i);
+                ((b - a).cross(c - a)).z.abs() * 0.5
+            })
+            .sum();
+        assert!((area - 5000.0).abs() / 5000.0 < 0.1, "{area}");
+        assert_eq!(d.colors.len(), d.positions.len());
+        assert!((d.colors[0][0] - 0.5).abs() < 1e-5);
+        // 72 bytes per displayed triangle.
+        assert_eq!(m.display_bytes(), 40_000 * 72);
+        // Small meshes pass through unchanged.
+        let c = TriMesh::cube(Vec3::ZERO, Vec3::ONE);
+        assert_eq!(c.decimated(100).indices.len(), 12);
     }
 }

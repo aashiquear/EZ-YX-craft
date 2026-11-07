@@ -3,6 +3,10 @@ on:
   push:
     tags: ["v*"]
 
+# Creating the GitHub release and attaching files needs write access.
+permissions:
+  contents: write
+
 jobs:
   package:
     name: package (${{ matrix.os }})
@@ -41,3 +45,8 @@ jobs:
             dist/**/*.dmg
             dist/**/*.msi
             dist/**/*.exe
+
+  # Android APK/AAB and iPad IPA (see docs/mobile.md), attached to the same release.
+  mobile:
+    uses: ./.github/workflows/mobile.yml
+    secrets: inherit

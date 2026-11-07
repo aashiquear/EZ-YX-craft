@@ -43,12 +43,51 @@ pub struct MachineState {
     pub settings: Vec<(u32, String)>,
     pub error: Option<String>,
     pub pending_job: Option<String>,
+    /// Job queue: G-code from files or sent by the pipeline (Machine Control never edits designs).
+    pub jobs: Vec<MachineJob>,
+    pub selected_job: Option<usize>,
+    /// Index of the job currently streaming.
+    pub running_job: Option<usize>,
+}
+
+/// A G-code program in the Machine Control queue.
+pub struct MachineJob {
+    pub name: String,
+    /// `pipeline` or the file path.
+    pub source: String,
+    pub gcode: String,
+    pub moves: Vec<ezyx_gcode::parse::ParsedMove>,
+    pub est_seconds: f64,
+    pub min: [f64; 3],
+    pub max: [f64; 3],
+}
+
+impl MachineJob {
+    pub fn new(name: String, gcode: String, source: &str, rapid: f64) -> Self {
+        let moves = ezyx_gcode::parse(&gcode);
+        let est_seconds = ezyx_gcode::parse::estimate_seconds(&moves, rapid);
+        let (mut min, mut max) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for m in moves.iter().filter(|m| !m.rapid) {
+            for i in 0..3 {
+                min[i] = min[i].min(m.to[i]).min(m.from[i]);
+                max[i] = max[i].max(m.to[i]).max(m.from[i]);
+            }
+        }
+        if min[0] > max[0] {
+            (min, max) = ([0.0; 3], [0.0; 3]);
+        }
+        Self { name, source: source.into(), gcode, moves, est_seconds, min, max }
+    }
+    pub fn lines(&self) -> usize {
+        self.gcode.lines().count()
+    }
 }
 
 impl Default for MachineState {
     fn default() -> Self {
         Self {
-            link: Link::Usb,
+            // Tablets reach the machine over Wi-Fi only.
+            link: if crate::platform::USB_SERIAL { Link::Usb } else { Link::WifiTcp },
             ports: vec![],
             port: String::new(),
             baud: 115_200,
@@ -69,11 +108,27 @@ impl Default for MachineState {
             settings: vec![],
             error: None,
             pending_job: None,
+            jobs: vec![],
+            selected_job: None,
+            running_job: None,
         }
     }
 }
 
 impl MachineState {
+    /// Queue a program (newest first in the list) and select it.
+    pub fn add_job(&mut self, name: String, gcode: String, source: &str) {
+        // Re-sending from the pipeline replaces the previous pipeline job.
+        if source == "pipeline" {
+            if let Some(i) = self.jobs.iter().position(|j| j.source == "pipeline" && j.name == name) {
+                if self.running_job != Some(i) {
+                    self.jobs.remove(i);
+                }
+            }
+        }
+        self.jobs.push(MachineJob::new(name, gcode, source, 3000.0));
+        self.selected_job = Some(self.jobs.len() - 1);
+    }
     pub fn connected(&self) -> bool {
         self.controller.is_some()
     }
@@ -135,25 +190,27 @@ impl MachineState {
     pub fn sender(&self) -> Option<crossbeam_channel::Sender<MCmd>> {
         self.controller.as_ref().map(|c| c.sender())
     }
-    fn line(&mut self, l: impl Into<String>) {
+    pub fn line(&mut self, l: impl Into<String>) {
         if let Some(c) = &self.controller {
             c.line(l);
         }
     }
-    fn rt(&self, b: u8) {
+    pub fn rt(&self, b: u8) {
         if let Some(c) = &self.controller {
             c.realtime(b);
         }
     }
 }
 
-pub fn show(app: &mut EzApp, ui: &mut Ui) {
+/// Connection bar: link type, endpoint, connect / disconnect. Returns true when connected.
+pub fn connection(app: &mut EzApp, ui: &mut Ui) -> bool {
     let m = &mut app.machine;
-    ui.heading("Machine");
     ui.label(RichText::new(&app.project.machine.connection_hint).small().color(theme::STEEL));
     if m.controller.is_none() {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut m.link, Link::Usb, "🔌 USB");
+            if crate::platform::USB_SERIAL {
+                ui.selectable_value(&mut m.link, Link::Usb, "🔌 USB");
+            }
             ui.selectable_value(&mut m.link, Link::WifiTcp, "📶 Wi-Fi TCP");
             ui.selectable_value(&mut m.link, Link::WifiWs, "📶 WebSocket");
             ui.selectable_value(&mut m.link, Link::Simulator, "🧪 Simulator");
@@ -242,12 +299,13 @@ pub fn show(app: &mut EzApp, ui: &mut Ui) {
         if let Some(e) = &m.error {
             ui.colored_label(theme::DANGER, e);
         }
-        return;
+        return false;
     }
 
     // ---- connected
     let st = m.status.lock().ok().and_then(|s| s.clone());
     ui.horizontal(|ui| {
+        ui.label(RichText::new(m.controller.as_ref().map(|c| c.endpoint.label()).unwrap_or_default()).strong());
         let (txt, col) = match st.as_ref().map(|s| s.state) {
             Some(MState::Idle) => ("IDLE", theme::OK),
             Some(MState::Run) => ("RUN", theme::ACCENT),
@@ -263,9 +321,13 @@ pub fn show(app: &mut EzApp, ui: &mut Ui) {
             m.controller = None;
         }
     });
-    if m.controller.is_none() {
-        return;
-    }
+    m.controller.is_some()
+}
+
+/// Position read-out, home / unlock / zero, jog pad and Z probe.
+pub fn dro_jog(app: &mut EzApp, ui: &mut Ui) {
+    let m = &mut app.machine;
+    let st = m.status.lock().ok().and_then(|s| s.clone());
     if let Some(s) = &st {
         if let Some(p) = s.work_pos() {
             egui::Grid::new("dro").num_columns(3).show(ui, |ui| {
@@ -273,8 +335,8 @@ pub fn show(app: &mut EzApp, ui: &mut Ui) {
                     if i == 3 && p[3] == 0.0 {
                         continue;
                     }
-                    ui.label(RichText::new(*a).strong().size(18.0));
-                    ui.label(RichText::new(format!("{:>9.3}", p[i])).monospace().size(18.0));
+                    ui.label(RichText::new(*a).strong().size(24.0));
+                    ui.label(RichText::new(format!("{:>9.3}", p[i])).monospace().size(26.0));
                     if ui.small_button("Zero").clicked() {
                         let l = cmd::zero(i == 0, i == 1, i == 2, i == 3);
                         m.line(l);
@@ -322,7 +384,7 @@ pub fn show(app: &mut EzApp, ui: &mut Ui) {
     let feed = m.jog_feed;
     let mut jog: Option<String> = None;
     egui::Grid::new("jog").spacing([4.0, 4.0]).show(ui, |ui| {
-        let b = |ui: &mut Ui, t: &str| ui.add_sized([44.0, 34.0], egui::Button::new(RichText::new(t).size(16.0))).clicked();
+        let b = |ui: &mut Ui, t: &str| ui.add_sized([58.0, 46.0], egui::Button::new(RichText::new(t).size(18.0))).clicked();
         ui.label("");
         if b(ui, "Y+") {
             jog = Some(cmd::jog(None, Some(step), None, None, feed));
@@ -386,28 +448,28 @@ pub fn show(app: &mut EzApp, ui: &mut Ui) {
             }
         });
     }
+}
+
+/// Run controls for the selected queued job, progress and overrides.
+pub fn job_controls(app: &mut EzApp, ui: &mut Ui) {
     let m = &mut app.machine;
-    ui.separator();
-    ui.label(RichText::new("Job").strong());
     let (acked, total, state) = m.progress;
     if total > 0 {
         ui.add(egui::ProgressBar::new(acked as f32 / total as f32).text(format!("{acked}/{total} · {state:?}")));
     }
     ui.horizontal(|ui| {
         let running = matches!(state, JobState::Running | JobState::Paused);
-        if ui.add_enabled(!running, egui::Button::new(RichText::new("▶ Run job").strong()).fill(theme::ACCENT_SOFT)).clicked() {
-            match ezyx_project::ops::export_gcode(&app.project, &app.library) {
-                Ok((g, w)) => {
-                    let m = &mut app.machine;
-                    m.pending_job = Some(g);
-                    if !w.is_empty() {
-                        m.error = Some(w.join("; "));
-                    }
-                }
-                Err(e) => app.machine.error = Some(e),
+        let can_run = !running && m.controller.is_some() && m.selected_job.is_some();
+        if ui
+            .add_enabled(can_run, egui::Button::new(RichText::new("▶ Run").strong().size(16.0)).fill(theme::ACCENT_SOFT))
+            .on_hover_text("Stream the selected job")
+            .clicked()
+        {
+            if let Some(j) = m.selected_job.and_then(|i| m.jobs.get(i)) {
+                m.pending_job = Some(j.gcode.clone());
+                m.running_job = m.selected_job;
             }
         }
-        let m = &mut app.machine;
         if ui.add_enabled(running, egui::Button::new("⏸ Pause")).clicked() {
             if let Some(c) = &m.controller {
                 c.send(MCmd::Pause);
@@ -424,7 +486,6 @@ pub fn show(app: &mut EzApp, ui: &mut Ui) {
             }
         }
     });
-    let m = &mut app.machine;
     ui.horizontal(|ui| {
         ui.label("Feed");
         if ui.small_button("−10%").clicked() {
@@ -447,15 +508,19 @@ pub fn show(app: &mut EzApp, ui: &mut Ui) {
     if let Some(e) = &m.error {
         ui.colored_label(theme::WARN, e);
     }
-    ui.separator();
-    ui.label(RichText::new("Console").strong());
-    egui::ScrollArea::vertical().max_height(160.0).stick_to_bottom(true).show(ui, |ui| {
+}
+
+/// Console log and manual command entry.
+pub fn console(app: &mut EzApp, ui: &mut Ui) {
+    let m = &mut app.machine;
+    egui::ScrollArea::vertical().max_height(ui.available_height() - 34.0).stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
         for l in &m.console {
             ui.label(RichText::new(l).monospace().small());
         }
     });
     ui.horizontal(|ui| {
-        let r = ui.add(egui::TextEdit::singleline(&mut m.input).hint_text("G-code or $ command").desired_width(220.0));
+        let running = matches!(m.progress.2, JobState::Running | JobState::Paused);
+        let r = ui.add_enabled(!running, egui::TextEdit::singleline(&mut m.input).hint_text("G-code or $ command").desired_width(320.0));
         if (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || ui.button("Send").clicked() {
             let l = std::mem::take(&mut m.input);
             if !l.trim().is_empty() {
@@ -471,6 +536,10 @@ pub fn confirm_dialog(app: &mut EzApp, ctx: &egui::Context) {
     let mut decision = None;
     egui::Window::new("Start job?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
         let secs = ezyx_gcode::parse::estimate_seconds(&ezyx_gcode::parse(&g), app.project.machine.limits.max_feed);
+        if let Some(j) = app.machine.running_job.and_then(|i| app.machine.jobs.get(i)) {
+            ui.label(RichText::new(&j.name).strong());
+            ui.label(format!("X {:.1}…{:.1}  Y {:.1}…{:.1}  Z down to {:.2} mm", j.min[0], j.max[0], j.min[1], j.max[1], j.min[2]));
+        }
         ui.label(format!("{} lines · about {:.0} min", g.lines().count(), secs / 60.0));
         ui.label("✔ Stock clamped, ✔ correct bit installed, ✔ XYZ zero set, ✔ dust collection & eye protection on.");
         ui.horizontal(|ui| {
@@ -489,7 +558,10 @@ pub fn confirm_dialog(app: &mut EzApp, ctx: &egui::Context) {
             }
             app.machine.pending_job = None;
         }
-        Some(false) => app.machine.pending_job = None,
+        Some(false) => {
+            app.machine.pending_job = None;
+            app.machine.running_job = None;
+        }
         None => {}
     }
 }

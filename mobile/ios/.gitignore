@@ -1,0 +1,6 @@
+*.xcodeproj/
+Rust.xcconfig
+build/
+DerivedData/
+*.ipa
+Info.plist

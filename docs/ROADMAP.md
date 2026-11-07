@@ -1,6 +1,15 @@
 # Roadmap
 
-## v0.2 — hardware & polish
+## v0.2 — pipeline & modules (this release)
+- [x] Pipeline main window: Stock → Design → Toolpaths → Output, feature timeline, conflict checks
+- [x] Automatic rough + finish planning per feature with per-pass bit overrides
+- [x] Image Studio, Solid Modeler and Machine Control as separate (tileable) windows
+- [x] Re-import from Image Studio / Solid Modeler with merge report
+- [x] Solid Modeler: constrained sketches, parameters/configurations, sweep/loft/holes/threads, mass props
+- [x] VCarve-style UX: snapping, measure, quick-key sizes, align/distribute/mirror, layers, job sheet
+- [x] Documentation pipeline: feature registry → manual scaffold, screenshots, LLM revision, CI PR
+
+## v0.2.x — hardware & polish
 - [ ] Verify on Genmitsu 4040 PRO MAX: USB streaming, Wi-Fi module protocol (see MACHINE_CONTROL.md)
 - [ ] Node editing, snapping to geometry, dimensions/measure tool
 - [ ] Dog-bone / T-bone fillets, lead-in/out arcs, tab editing by click
@@ -22,8 +31,10 @@
 - [ ] Rotary: indexed 4-axis roughing, spiral finishing
 
 ## v0.5 — design depth
-- [ ] Constraint-based 2D sketcher (SolveSpace-style solver)
-- [ ] B-rep backend (truck or OpenCascade FFI) for exact edges and STEP import/export
+- [ ] Sketch: drag with live solve, trim/extend, offset entities, sketch text, reference other features' edges
+- [ ] B-rep backend (truck, like SolidCraft, or OpenCascade FFI) for exact edges and STEP import/export;
+      fillet/chamfer of picked edges; assemblies with joints and motion; sheet metal
+- [ ] Toolpath templates (save/apply plan sets), nesting, tiling
 - [ ] BCC isosurface stuffing with guaranteed dihedral bounds; boundary-conforming tet export with surface tags
 - [ ] Neural image→3D: local ONNX (TripoSR/TRELLIS) via `ort` with GPU EPs; remote API presets
 

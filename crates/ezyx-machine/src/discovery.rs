@@ -7,11 +7,11 @@ use std::time::Duration;
 
 /// Serial ports likely to be CNC controllers (CH340/CP210x/FTDI/ACM).
 pub fn serial_ports() -> Vec<Endpoint> {
-    #[cfg(feature = "serial")]
+    #[cfg(serial)]
     {
         crate::transport::SerialTransport::list().into_iter().map(|port| Endpoint::Serial { port, baud: 115_200 }).collect()
     }
-    #[cfg(not(feature = "serial"))]
+    #[cfg(not(serial))]
     {
         vec![]
     }

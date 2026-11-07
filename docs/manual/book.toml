@@ -1,0 +1,20 @@
+[book]
+title = "EZ-YX-craft User Manual"
+description = "How to design, carve and run jobs with EZ-YX-craft, the open-source CNC carving suite."
+authors = ["EZ-YX-craft contributors"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+# Chapters come from registry.json via tools/docs/update_manual.py scaffold; never let mdBook invent empty ones.
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/aashiquear/EZ-YX-craft"
+edit-url-template = "https://github.com/aashiquear/EZ-YX-craft/edit/main/docs/manual/{path}"
+site-url = "/EZ-YX-craft/"
+no-section-label = false
+
+[output.html.search]
+enable = true

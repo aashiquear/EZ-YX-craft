@@ -1,7 +1,7 @@
 //! Commands: the single mutation API used by GUI, CLI and AI. Serde-tagged so the AI assistant
 //! and macros/scripts can produce them as JSON.
 
-use crate::{ops::OperationSpec, text, Id, MeshObject, PartObject, Project, ReliefObject, VectorSource};
+use crate::{ops::OperationSpec, pipeline, text, Id, MeshObject, PartObject, Project, ReliefObject, VectorSource};
 use ezyx_core::{path::shapes, region::Region, DAffine2, DVec2, JobSetup};
 use ezyx_image::{photo_vcarve::PhotoVCarveOptions, relief::ReliefOptions, trace::TraceOptions};
 use serde::{Deserialize, Serialize};
@@ -144,6 +144,72 @@ pub enum Command {
     SetOperationEnabled {
         id: Id,
         enabled: bool,
+    },
+    /// Affine transform `[a, b, c, d, e, f]` (x' = a·x + c·y + e, y' = b·x + d·y + f) about the
+    /// selection's centre when `about_center`, else about the origin.
+    TransformVectors {
+        ids: Vec<Id>,
+        matrix: [f64; 6],
+        about_center: bool,
+    },
+    AddLayer {
+        name: String,
+    },
+    SetVectorLayer {
+        ids: Vec<Id>,
+        layer: usize,
+    },
+    /// Replace a Solid Modeler part (bumps its revision).
+    SetPart {
+        id: Id,
+        part: ezyx_cad::Part,
+    },
+    RemovePart {
+        id: Id,
+    },
+    // ---- pipeline (see `crate::pipeline`)
+    SetStockShape {
+        shape: crate::pipeline::StockShape,
+    },
+    /// Carve the given vectors with a 2D strategy (creates a pipeline feature + its toolpaths).
+    CarveVectors {
+        ids: Vec<Id>,
+        strategy: crate::pipeline::CutStrategy,
+        depth: Option<f64>,
+        name: Option<String>,
+    },
+    /// Import geometry from an editor (Image Studio, Solid Modeler, file) as a new feature.
+    ImportFeature {
+        name: String,
+        payload: crate::pipeline::Payload,
+        source: crate::pipeline::FeatureSource,
+    },
+    /// A new revision of an existing feature came back from its editor: merge downstream.
+    ReimportFeature {
+        id: Id,
+        payload: crate::pipeline::Payload,
+        source: Option<crate::pipeline::FeatureSource>,
+    },
+    UpdateFeature {
+        id: Id,
+        name: Option<String>,
+        strategy: Option<crate::pipeline::CutStrategy>,
+        depth: Option<f64>,
+        plan: Option<crate::pipeline::PlanSettings>,
+        suppressed: Option<bool>,
+    },
+    RemoveFeature {
+        id: Id,
+        delete_geometry: bool,
+    },
+    /// Move a feature to a new position in the timeline.
+    MoveFeature {
+        id: Id,
+        to: usize,
+    },
+    /// Re-plan the automatic toolpaths (empty = every feature) with the current settings.
+    PlanToolpaths {
+        feature_ids: Vec<Id>,
     },
 }
 
@@ -343,6 +409,9 @@ impl Command {
                     vector_ids: vec![],
                     direction: Default::default(),
                     cutting_override: None,
+                    feature_id: None,
+                    auto: false,
+                    feature_rev: 0,
                 });
                 format!("Added photo V-carve operation #{id} ({n} grooves, max depth {:.2} mm)", options.max_depth())
             }
@@ -387,12 +456,12 @@ impl Command {
             }
             AddDemoPart => {
                 let id = p.alloc_id();
-                p.parts.push(PartObject { id, part: ezyx_cad::demo_part(), visible: true });
+                p.parts.push(PartObject { id, part: ezyx_cad::demo_part(), visible: true, revision: 1 });
                 format!("Added demo part #{id}")
             }
             AddPart { part } => {
                 let id = p.alloc_id();
-                p.parts.push(PartObject { id, part: part.clone(), visible: true });
+                p.parts.push(PartObject { id, part: part.clone(), visible: true, revision: 1 });
                 format!("Added part #{id} '{}'", part.name)
             }
             AddOperation { spec } => {
@@ -410,6 +479,108 @@ impl Command {
                 let o = p.operations.iter_mut().find(|o| o.id == *id).ok_or("no such operation")?;
                 o.enabled = *enabled;
                 format!("Operation #{id} enabled={enabled}")
+            }
+            TransformVectors { ids, matrix: m, about_center } => {
+                let t = DAffine2::from_cols_array(m);
+                let t = if *about_center {
+                    let c = vec_center(p, ids);
+                    DAffine2::from_translation(c) * t * DAffine2::from_translation(-c)
+                } else {
+                    t
+                };
+                let n = transform(p, ids, t);
+                format!("Transformed {n} vectors")
+            }
+            AddLayer { name } => {
+                p.layers.push(crate::Layer { name: name.clone(), visible: true, color: [30, 30, 30], locked: false });
+                format!("Added layer '{name}'")
+            }
+            SetVectorLayer { ids, layer } => {
+                if *layer >= p.layers.len() {
+                    return Err(format!("no layer {layer}"));
+                }
+                let mut n = 0;
+                for v in p.vectors.iter_mut().filter(|v| ids.contains(&v.id)) {
+                    v.layer = *layer;
+                    n += 1;
+                }
+                format!("Moved {n} vectors to layer '{}'", p.layers[*layer].name)
+            }
+            SetPart { id, part } => {
+                let po = p.parts.iter_mut().find(|q| q.id == *id).ok_or_else(|| format!("no part #{id}"))?;
+                po.part = part.clone();
+                po.revision += 1;
+                format!("Part '{}' rev {}", part.name, po.revision)
+            }
+            RemovePart { id } => {
+                p.parts.retain(|q| q.id != *id);
+                format!("Removed part #{id}")
+            }
+            SetStockShape { shape } => {
+                p.stock_shape = *shape;
+                if *shape == crate::pipeline::StockShape::Round {
+                    let d = p.job.width.min(p.job.height);
+                    p.job.width = d;
+                    p.job.height = d;
+                }
+                format!("Stock shape: {}", shape.label())
+            }
+            CarveVectors { ids, strategy, depth, name } => {
+                let id = pipeline::feature_from_vectors(p, pipeline::default_library(), ids, *strategy, *depth, name.clone())?;
+                let n = p.operations.iter().filter(|o| o.feature_id == Some(id)).count();
+                format!("Feature #{id}: {} with {n} toolpath(s)", strategy.label())
+            }
+            ImportFeature { name, payload, source } => {
+                let kind = payload.kind_label();
+                let id = pipeline::import_feature(p, pipeline::default_library(), name, payload.clone(), source.clone())?;
+                let n = p.operations.iter().filter(|o| o.feature_id == Some(id)).count();
+                format!("Imported '{name}' as {kind} (feature #{id}, {n} toolpath(s) planned)")
+            }
+            ReimportFeature { id, payload, source } => pipeline::reimport(p, pipeline::default_library(), *id, payload.clone(), source.clone())?.summary(),
+            UpdateFeature { id, name, strategy, depth, plan, suppressed } => {
+                let f = p.features.iter_mut().find(|f| f.id == *id).ok_or_else(|| format!("no feature #{id}"))?;
+                if let Some(n) = name {
+                    f.name = n.clone();
+                }
+                if let pipeline::FeatureKind::Cut2D { strategy: s, depth: d, .. } = &mut f.kind {
+                    if let Some(v) = strategy {
+                        *s = *v;
+                    }
+                    if let Some(v) = depth {
+                        *d = *v;
+                    }
+                } else if strategy.is_some() || depth.is_some() {
+                    return Err("strategy and depth apply to 2D features only".into());
+                }
+                if let Some(pl) = plan {
+                    f.plan = pl.clone();
+                }
+                if let Some(s) = suppressed {
+                    f.suppressed = *s;
+                }
+                let fname = f.name.clone();
+                let (n, errs) = pipeline::replan(p, pipeline::default_library(), &[*id]);
+                if let Some(e) = errs.first() {
+                    return Err(e.clone());
+                }
+                format!("Updated '{fname}' ({n} toolpath(s))")
+            }
+            RemoveFeature { id, delete_geometry } => pipeline::remove_feature(p, *id, *delete_geometry)?,
+            MoveFeature { id, to } => {
+                let i = p.features.iter().position(|f| f.id == *id).ok_or_else(|| format!("no feature #{id}"))?;
+                let f = p.features.remove(i);
+                let to = (*to).min(p.features.len());
+                p.features.insert(to, f);
+                pipeline::sort_operations(p);
+                format!("Moved feature #{id} to position {}", to + 1)
+            }
+            PlanToolpaths { feature_ids } => {
+                let (n, errs) = pipeline::replan(p, pipeline::default_library(), feature_ids);
+                if errs.is_empty() {
+                    format!("Planned {n} toolpath(s)")
+                } else {
+                    format!("Planned {n} toolpath(s); ⚠ {}", errs.join("; "))
+                }
             }
         })
     }
@@ -512,6 +683,32 @@ mod tests {
         assert!(h.execute(&mut p, &Command::SetMachine { id: "nope".into() }).is_err());
         assert_eq!(p.vectors.len(), 1);
     }
+    #[test]
+    fn pipeline_commands_roundtrip() {
+        let mut p = Project::default();
+        let mut h = History::default();
+        h.execute(&mut p, &Command::AddCircle { cx: 100.0, cy: 100.0, r: 20.0 }).unwrap();
+        let ids: Vec<Id> = p.vectors.iter().map(|v| v.id).collect();
+        let c: Command = serde_json::from_str(&format!(r#"{{"cmd":"carve_vectors","ids":{ids:?},"strategy":"Pocket","depth":4.0,"name":null}}"#)).unwrap();
+        h.execute(&mut p, &c).unwrap();
+        assert_eq!(p.features.len(), 1);
+        assert_eq!(p.operations.len(), 2);
+        let fid = p.features[0].id;
+        h.execute(
+            &mut p,
+            &Command::UpdateFeature { id: fid, name: None, strategy: Some(pipeline::CutStrategy::Engrave), depth: Some(0.5), plan: None, suppressed: None },
+        )
+        .unwrap();
+        assert_eq!(p.operations.len(), 1);
+        assert_eq!(p.operations[0].kind.label(), "Engrave");
+        h.execute(&mut p, &Command::UpdateFeature { id: fid, name: None, strategy: None, depth: None, plan: None, suppressed: Some(true) }).unwrap();
+        assert!(p.operations.is_empty());
+        assert!(h.undo(&mut p));
+        assert_eq!(p.operations.len(), 1);
+        h.execute(&mut p, &Command::RemoveFeature { id: fid, delete_geometry: true }).unwrap();
+        assert!(p.features.is_empty() && p.vectors.is_empty() && p.operations.is_empty());
+    }
+
     #[test]
     fn json_commands() {
         let c: Command = serde_json::from_str(r#"{"cmd":"add_circle","cx":5,"cy":5,"r":2}"#).unwrap();

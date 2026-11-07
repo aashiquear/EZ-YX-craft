@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+name = "ezyx_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ez-yx-craft"
 path = "src/main.rs"
@@ -24,9 +28,7 @@ ezyx-sim.workspace = true
 ezyx-gpu.workspace = true
 ezyx-ai.workspace = true
 ezyx-project.workspace = true
-eframe.workspace = true
 egui.workspace = true
-rfd.workspace = true
 glam.workspace = true
 image.workspace = true
 serde.workspace = true
@@ -34,7 +36,21 @@ serde_json.workspace = true
 crossbeam-channel.workspace = true
 dirs.workspace = true
 log.workspace = true
+
+# Desktop: native file dialogs, all eframe features (clipboard, system fonts, accessibility).
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+eframe.workspace = true
+rfd.workspace = true
 env_logger.workspace = true
+
+# iPad: Metal via wgpu. (No clipboard/system-font/accesskit backends on iOS.)
+[target.'cfg(target_os = "ios")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "links"] }
+
+# Android: NativeActivity (no Java code), Vulkan or GLES via wgpu. accesskit needs GameActivity.
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "links", "android-native-activity"] }
+winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }
 
 # Installers (cargo-packager: .deb/.AppImage on Linux, .dmg/.app on macOS, .msi/NSIS on Windows)
 [package.metadata.packager]
