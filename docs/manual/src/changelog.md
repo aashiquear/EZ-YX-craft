@@ -7,12 +7,14 @@ What changed in EZ-YX-craft between revisions of this manual. This page is gener
 
 ### New features
 
+- **mobile:** iPad and Android apps with CI build and release path (`d26fc1e`)
 - **app:** pipeline main window + Image Studio, Solid Modeler, Machine Control windows (`5e4a597`)
 - **pipeline:** feature timeline, automatic rough+finish planning, conflicts and re-import merge (`959e6d4`)
 - **cad:** SolidWorks-style kernel — constrained sketches, parameters, sweep/loft/holes/threads (`dc1ff85`)
 
 ### Fixes
 
+- **ios:** keep ANSI colour codes out of the Rust linker flags (`4eb181f`)
 - **gpu:** keep viewport buffers under the device limit, CPU-rendering fallback (`9e10e43`)
 
 ### Documentation
